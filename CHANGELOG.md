@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 — 2026-08-25
+
+- Explicitly remove an inherited `SECRET_KEY` export attribute before prompting,
+  preventing the real node secret from reaching child processes.
+
 ## 1.0.1 — 2026-08-25
 
 - Bind the UFW rollback snapshot to the exact backed-up file metadata.

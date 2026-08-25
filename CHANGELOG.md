@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.3 — 2026-08-25
+
+- Do not upgrade installed OS, firewall, or Docker packages before the
+  transactional backup on a managed reconfiguration.
+- Remove inherited Docker platform/API overrides before using the pinned image.
+
 ## 1.0.2 — 2026-08-25
 
 - Explicitly remove an inherited `SECRET_KEY` export attribute before prompting,

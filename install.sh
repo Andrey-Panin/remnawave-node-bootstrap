@@ -8,12 +8,13 @@ umask 077
 # Python configuration. The installer always talks to the local Docker socket.
 export PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 export DOCKER_HOST='unix:///var/run/docker.sock'
-unset DOCKER_CONTEXT DOCKER_CONFIG COMPOSE_FILE COMPOSE_PROJECT_NAME COMPOSE_PROFILES COMPOSE_ENV_FILES
+unset DOCKER_CONTEXT DOCKER_CONFIG DOCKER_DEFAULT_PLATFORM DOCKER_API_VERSION
+unset COMPOSE_FILE COMPOSE_PROJECT_NAME COMPOSE_PROFILES COMPOSE_ENV_FILES
 unset PYTHONHOME PYTHONPATH CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
 unset GNUPGHOME APT_CONFIG GIT_CONFIG_COUNT
 unset SECRET_KEY
 
-readonly INSTALLER_VERSION='1.0.2'
+readonly INSTALLER_VERSION='1.0.3'
 readonly CONFIG_SCHEMA_VERSION='1'
 readonly MANAGED_BY='remnawave-node-bootstrap'
 readonly INSTALL_DIR='/opt/remnanode'
@@ -532,7 +533,7 @@ install_base_packages() {
     apt-get update -qq
     local packages=(ca-certificates curl gnupg python3 iproute2 util-linux)
     [[ "$FIREWALL_MODE" == 'ufw' ]] && packages+=(ufw iptables nftables)
-    apt-get install -y -qq "${packages[@]}"
+    apt-get install -y -qq --no-upgrade "${packages[@]}"
 }
 
 install_docker() {
@@ -589,7 +590,7 @@ install_docker() {
     chmod 0644 /etc/apt/sources.list.d/docker.list
 
     apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    apt-get install -y -qq --no-upgrade docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     systemctl enable --now docker >/dev/null
     docker compose version >/dev/null
     docker info >/dev/null

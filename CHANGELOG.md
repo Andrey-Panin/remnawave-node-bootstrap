@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 — 2026-08-25
+
+- Bind the UFW rollback snapshot to the exact backed-up file metadata.
+- Keep the node stopped when firewall rollback cannot be proven complete.
+- Add filesystem durability barriers for UFW state.
+- Reject any pre-existing raw firewall rules on a fresh managed VPS.
+
 ## 1.0.0 — 2026-08-25
 
 - first public Remnawave Node bootstrap release;

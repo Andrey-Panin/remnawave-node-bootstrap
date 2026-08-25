@@ -12,7 +12,7 @@ unset DOCKER_CONTEXT DOCKER_CONFIG COMPOSE_FILE COMPOSE_PROJECT_NAME COMPOSE_PRO
 unset PYTHONHOME PYTHONPATH CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
 unset GNUPGHOME APT_CONFIG GIT_CONFIG_COUNT
 
-readonly INSTALLER_VERSION='1.0.0'
+readonly INSTALLER_VERSION='1.0.1'
 readonly CONFIG_SCHEMA_VERSION='1'
 readonly MANAGED_BY='remnawave-node-bootstrap'
 readonly INSTALL_DIR='/opt/remnanode'
@@ -660,6 +660,22 @@ compute_ufw_policy_hash() {
     } | sha256sum | awk '{print $1}'
 }
 
+compute_ufw_backup_policy_hash() {
+    local manifest="${BACKUP_DIR}/ufw-files.manifest"
+    local path record presence backup_name mode uid gid size hash
+    {
+        while IFS= read -r path; do
+            record="$(manifest_record_for_path "$manifest" "$path")" || return 1
+            IFS=$'\t' read -r presence _ backup_name mode uid gid size hash <<<"$record"
+            case "$presence" in
+                present) printf 'present %s %s:%s:%s %s\n' "$path" "$uid" "$gid" "$mode" "$hash" ;;
+                missing) printf 'missing %s\n' "$path" ;;
+                *) return 1 ;;
+            esac
+        done < <(ufw_policy_files)
+    } | sha256sum | awk '{print $1}'
+}
+
 effective_firewall_snapshot() {
     local command_name output
     local -a save_commands=(iptables-save ip6tables-save)
@@ -726,7 +742,9 @@ snapshot_firewall_and_complete_backup() {
     fi
     chmod 0600 "${BACKUP_DIR}/ufw-status.txt" "${BACKUP_DIR}/ufw-added.txt"
     printf 'ufw_previous_active=%s\n' "$UFW_PREVIOUS_ACTIVE" >>"${BACKUP_DIR}/metadata"
-    SNAPSHOT_UFW_POLICY_HASH="$(compute_ufw_policy_hash)"
+    verify_live_ufw_snapshot || die 'Live firewall files changed while their backup was being created'
+    SNAPSHOT_UFW_POLICY_HASH="$(compute_ufw_backup_policy_hash)" || \
+        die 'Unable to derive the firewall policy hash from its backup manifest'
     printf 'ufw_policy_hash=%s\n' "$SNAPSHOT_UFW_POLICY_HASH" >>"${BACKUP_DIR}/metadata"
     SNAPSHOT_EFFECTIVE_FIREWALL_HASH="$(compute_effective_firewall_hash)" || \
         die 'Unable to snapshot the effective firewall ruleset'
@@ -769,6 +787,25 @@ verify_ufw_backup_integrity() {
             missing)
                 [[ "$backup_name" == '-' && "$mode" == '-' && "$uid" == '-' && "$gid" == '-' && "$size" == '-' && "$hash" == '-' ]] || return 1
                 [[ ! -e "${BACKUP_DIR}/ufw-files/${expected_name}" && ! -L "${BACKUP_DIR}/ufw-files/${expected_name}" ]] || return 1
+                ;;
+            *) return 1 ;;
+        esac
+    done < <(ufw_policy_files)
+}
+
+verify_live_ufw_snapshot() {
+    local manifest="${BACKUP_DIR}/ufw-files.manifest"
+    local path record presence backup_name mode uid gid size hash
+    [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
+    while IFS= read -r path; do
+        record="$(manifest_record_for_path "$manifest" "$path")" || return 1
+        IFS=$'\t' read -r presence _ backup_name mode uid gid size hash <<<"$record"
+        case "$presence" in
+            present)
+                file_matches_metadata "$path" "$mode" "$uid" "$gid" "$size" "$hash" || return 1
+                ;;
+            missing)
+                [[ ! -e "$path" && ! -L "$path" ]] || return 1
                 ;;
             *) return 1 ;;
         esac
@@ -942,6 +979,7 @@ verify_pre_apply_drift() {
     verify_backup_integrity || die 'Backup integrity verification failed before apply'
     verify_live_managed_snapshot || die 'Managed files changed after their backup; refusing apply'
     runtime_snapshot_is_current || die 'Container or listener state changed after its snapshot; refusing apply'
+    verify_live_ufw_snapshot || die 'Firewall policy files changed after their backup; refusing apply'
     [[ "$(compute_ufw_policy_hash)" == "$SNAPSHOT_UFW_POLICY_HASH" ]] || \
         die 'Firewall policy files changed after their snapshot; refusing apply'
     [[ "$(compute_effective_firewall_hash)" == "$SNAPSHOT_EFFECTIVE_FIREWALL_HASH" ]] || \
@@ -1103,7 +1141,7 @@ assert_pristine_ufw_conffiles() {
 }
 
 assert_clean_effective_input_rules() {
-    local command_name output policy nft_rules
+    local command_name output nft_rules
     if ! command -v iptables-save >/dev/null 2>&1 || ! command -v ip6tables-save >/dev/null 2>&1; then
         die 'iptables-save backends are unavailable; use --external-firewall'
     fi
@@ -1112,13 +1150,48 @@ assert_clean_effective_input_rules() {
     [[ -s /proc/net/ip6_tables_names ]] && save_commands+=(ip6tables-legacy-save)
     for command_name in "${save_commands[@]}"; do
         command -v "$command_name" >/dev/null 2>&1 || continue
-        output="$($command_name -t filter)" || \
-            die "Unable to inspect ${command_name} effective filter rules"
-        policy="$(awk '$1 == ":INPUT" {print $2; exit}' <<<"$output")"
-        [[ "$policy" == 'ACCEPT' ]] || \
-            die "Pre-existing ${command_name} INPUT policy is not clean; use --external-firewall"
-        ! grep -q '^-A INPUT ' <<<"$output" || \
-            die "Pre-existing ${command_name} INPUT rules detected; use --external-firewall"
+        output="$($command_name)" || die "Unable to inspect ${command_name} rules"
+        if ! IPTABLES_SAVE_TEXT="$output" python3 -I - <<'PY'
+import os
+import re
+
+builtins = {
+    "filter": {"INPUT", "FORWARD", "OUTPUT"},
+    "nat": {"PREROUTING", "INPUT", "OUTPUT", "POSTROUTING"},
+    "mangle": {"PREROUTING", "INPUT", "FORWARD", "OUTPUT", "POSTROUTING"},
+    "raw": {"PREROUTING", "OUTPUT"},
+    "security": {"INPUT", "FORWARD", "OUTPUT"},
+}
+table = None
+for raw in os.environ.get("IPTABLES_SAVE_TEXT", "").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("*"):
+        table = line[1:]
+        if table not in builtins:
+            raise SystemExit(2)
+        continue
+    if line == "COMMIT":
+        if table is None:
+            raise SystemExit(2)
+        table = None
+        continue
+    match = re.fullmatch(r":(\S+)\s+(\S+)\s+\[[0-9]+:[0-9]+\]", line)
+    if match and table is not None:
+        chain, policy = match.groups()
+        if chain not in builtins[table] or policy != "ACCEPT":
+            raise SystemExit(2)
+        continue
+    # Any append, custom chain, counter, NAT, mangle, or otherwise unknown
+    # statement means this is not a pristine dedicated host.
+    raise SystemExit(2)
+if table is not None:
+    raise SystemExit(2)
+PY
+        then
+            die "Pre-existing ${command_name} firewall rules detected; use --external-firewall"
+        fi
     done
 
     if command -v nft >/dev/null 2>&1; then
@@ -1127,36 +1200,25 @@ assert_clean_effective_input_rules() {
         if ! NFT_RULESET="$nft_rules" python3 -I - <<'PY'
 import os
 import re
-import sys
 
-lines = os.environ.get("NFT_RULESET", "").splitlines()
-i = 0
-while i < len(lines):
-    stripped = lines[i].strip()
-    if not re.match(r"chain\s+\S+\s*\{", stripped):
-        i += 1
-        continue
-    block = [stripped]
-    depth = stripped.count("{") - stripped.count("}")
-    i += 1
-    while i < len(lines) and depth > 0:
-        current = lines[i].strip()
-        block.append(current)
-        depth += current.count("{") - current.count("}")
-        i += 1
-    text = "\n".join(block)
-    if "hook input" not in text:
-        continue
-    cleaned = re.sub(r"^chain\s+\S+\s*\{", "", text)
-    cleaned = cleaned.replace("}", "")
-    cleaned = re.sub(r"type\s+filter\s+hook\s+input\s+priority\s+[^;]+;", "", cleaned)
-    cleaned = re.sub(r"policy\s+accept\s*;", "", cleaned)
-    if cleaned.strip():
-        raise SystemExit(2)
-raise SystemExit(0)
+text = os.environ.get("NFT_RULESET", "")
+text = re.sub(r"(?m)^\s*#.*$", "", text)
+text = re.sub(r"table\s+\S+\s+\S+\s*\{", "", text)
+text = re.sub(r"chain\s+\S+\s*\{", "", text)
+text = re.sub(
+    r"type\s+(?:filter|nat|route)\s+hook\s+"
+    r"(?:prerouting|input|forward|output|postrouting|ingress)\s+"
+    r"priority\s+[^;]+;",
+    "",
+    text,
+)
+text = re.sub(r"policy\s+accept\s*;", "", text)
+text = text.replace("}", "")
+if text.strip():
+    raise SystemExit(2)
 PY
         then
-            die 'Pre-existing native nftables INPUT rules detected; use --external-firewall'
+            die 'Pre-existing native nftables rules detected; use --external-firewall'
         fi
     fi
 }
@@ -1317,7 +1379,8 @@ sync_success_state() {
         sync "$path"
     done
     if (( UFW_MUTATED == 1 )); then
-        sync /etc/ufw
+        sync -f /etc/ufw
+        sync -f /etc/default
     fi
     docker_root="$(docker info --format '{{.DockerRootDir}}')"
     [[ -n "$docker_root" && -d "$docker_root" && ! -L "$docker_root" ]] || \
@@ -1577,7 +1640,8 @@ sync_restored_state() {
         sync "$path" >/dev/null 2>&1 || record_rollback_error "failed to sync ${path}"
     done
     if (( UFW_MUTATED == 1 )) && [[ -d /etc/ufw ]]; then
-        sync /etc/ufw >/dev/null 2>&1 || record_rollback_error 'failed to sync restored UFW files'
+        sync -f /etc/ufw >/dev/null 2>&1 || record_rollback_error 'failed to sync restored UFW files'
+        sync -f /etc/default >/dev/null 2>&1 || record_rollback_error 'failed to sync restored UFW defaults'
     fi
     sync -f "$INSTALL_DIR" >/dev/null 2>&1 || record_rollback_error 'failed to sync the installation filesystem'
 }
@@ -1593,7 +1657,17 @@ rollback() {
         record_rollback_error 'backup integrity verification failed; no restore actions were attempted'
         return 1
     fi
+    local firewall_errors_before=${#ROLLBACK_ERRORS[@]}
     restore_firewall_snapshot
+    if (( ${#ROLLBACK_ERRORS[@]} > firewall_errors_before )); then
+        # Never restart the previous node while its Panel-only firewall ACL is
+        # uncertain. Stop the current node and leave the durable unresolved
+        # marker and root-only backup for manual reconciliation.
+        stop_current_managed_container
+        sync_restored_state
+        warn 'Firewall rollback could not be proven; node remains stopped and rollback is fail-closed'
+        return 1
+    fi
     stop_current_managed_container
     restore_managed_files
     restore_container_state

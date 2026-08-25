@@ -1,0 +1,27 @@
+title = "Remnawave node bootstrap secret rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "proxy-share-uri"
+description = "Proxy share links contain bearer credentials"
+regex = '''(?i)(hysteria2|hy2|vless|trojan|ss)://[^\s"']+'''
+keywords = ["hysteria2://", "hy2://", "vless://", "trojan://", "ss://"]
+
+[[rules]]
+id = "remnawave-secret-key"
+description = "A populated Remnawave node SECRET_KEY"
+regex = '''SECRET_KEY\s*=\s*[A-Za-z0-9+/=_-]{128,}'''
+keywords = ["SECRET_KEY="]
+
+[[rules]]
+id = "remnawave-decoded-node-key"
+description = "Decoded structure of a Remnawave node SECRET_KEY"
+regex = '''(?i)"(?:nodeCertPem|nodeKeyPem|caCertPem|jwtPublicKey)"\s*:'''
+keywords = ["nodeCertPem", "nodeKeyPem", "caCertPem", "jwtPublicKey"]
+
+[[rules]]
+id = "tokenized-subscription-url"
+description = "Subscription URLs are bearer credentials"
+regex = '''https?://(?:sub\.[A-Za-z0-9.-]+/[A-Za-z0-9_-]{16,}|[A-Za-z0-9.-]+/api/sub/[A-Za-z0-9_-]{16,})(?:/json)?'''

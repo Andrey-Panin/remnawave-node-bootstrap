@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+
+      - name: Shell syntax
+        run: bash -n install.sh status.sh tests/test_functions.sh
+
+      - name: Shellcheck
+        run: shellcheck -x -P SCRIPTDIR install.sh status.sh tests/test_functions.sh
+
+      - name: Installer function tests
+        run: bash tests/test_functions.sh
+
+      - name: Static secret and invariant checks
+        run: python3 tests/test_static.py
+
+      - name: Compatibility smoke tests
+        run: |
+          images=(
+            'ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517'
+            'ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc'
+          )
+          for image in "${images[@]}"; do
+            docker run --rm --volume "$PWD:/repo:ro" --workdir /repo "$image" \
+              bash -ec 'apt-get update -qq && apt-get install -y -qq python3 >/dev/null && bash -n install.sh status.sh tests/test_functions.sh && bash tests/test_functions.sh && python3 tests/test_static.py'
+          done
+
+      - name: Install pinned Gitleaks
+        run: |
+          version='8.30.0'
+          archive="gitleaks_${version}_linux_x64.tar.gz"
+          curl --disable --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${archive}" \
+            --output "$archive"
+          echo '79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e  gitleaks_8.30.0_linux_x64.tar.gz' | sha256sum --check
+          tar --extract --gzip --file "$archive" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      - name: Prove Gitleaks detector fails closed
+        run: |
+          canary_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$canary_dir"' EXIT
+          scheme='hysteria2'
+          printf '%s://%s\n' "$scheme" 'fixture@example.test:443' >"$canary_dir/canary.txt"
+          set +e
+          gitleaks dir "$canary_dir" --redact --no-banner --max-decode-depth 1 --config .gitleaks.toml
+          proxy_canary_rc=$?
+          set -e
+          if (( proxy_canary_rc != 1 )); then
+            echo "Gitleaks proxy canary returned ${proxy_canary_rc}; expected leak exit 1" >&2
+            exit 1
+          fi
+          printf '{"node%s":"fixture","node%s":"fixture","ca%s":"fixture","jwt%s":"fixture"}' \
+            'CertPem' 'KeyPem' 'CertPem' 'PublicKey' | base64 --wrap=0 >"$canary_dir/encoded.txt"
+          set +e
+          gitleaks dir "$canary_dir/encoded.txt" --redact --no-banner --max-decode-depth 1 \
+            --enable-rule remnawave-decoded-node-key --config .gitleaks.toml
+          decoded_canary_rc=$?
+          set -e
+          if (( decoded_canary_rc != 1 )); then
+            echo "Gitleaks decoded canary returned ${decoded_canary_rc}; expected leak exit 1" >&2
+            exit 1
+          fi
+
+      - name: Gitleaks
+        run: gitleaks git --redact --verbose --no-banner --max-decode-depth 1 --config .gitleaks.toml

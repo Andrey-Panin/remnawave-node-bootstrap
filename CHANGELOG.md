@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.4 — 2026-08-26
+
+- Exclude live iptables packet/byte counters from the effective-firewall drift
+  hash while continuing to detect every policy and rule change.
+
 ## 1.0.3 — 2026-08-25
 
 - Do not upgrade installed OS, firewall, or Docker packages before the

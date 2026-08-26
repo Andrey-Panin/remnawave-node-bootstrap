@@ -21,7 +21,7 @@
 Запустите на новом Ubuntu VPS от пользователя с `sudo`:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git && git clone --branch v1.0.3 --depth 1 https://github.com/Andrey-Panin/remnawave-node-bootstrap.git
+sudo apt-get update && sudo apt-get install -y git && git clone --branch v1.0.4 --depth 1 https://github.com/Andrey-Panin/remnawave-node-bootstrap.git
 cd remnawave-node-bootstrap
 sudo bash install.sh
 ```

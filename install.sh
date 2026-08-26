@@ -14,7 +14,7 @@ unset PYTHONHOME PYTHONPATH CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
 unset GNUPGHOME APT_CONFIG GIT_CONFIG_COUNT
 unset SECRET_KEY
 
-readonly INSTALLER_VERSION='1.0.4'
+readonly INSTALLER_VERSION='1.0.5'
 readonly CONFIG_SCHEMA_VERSION='1'
 readonly MANAGED_BY='remnawave-node-bootstrap'
 readonly INSTALL_DIR='/opt/remnanode'
@@ -536,10 +536,17 @@ install_base_packages() {
     apt-get install -y -qq --no-upgrade "${packages[@]}"
 }
 
+ensure_docker_service() {
+    systemctl daemon-reload
+    systemctl reset-failed docker.service docker.socket >/dev/null 2>&1 || true
+    systemctl enable --now docker.socket >/dev/null
+    systemctl enable --now docker.service >/dev/null
+}
+
 install_docker() {
     if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
         info 'Docker and Compose plugin already installed'
-        systemctl enable --now docker >/dev/null
+        ensure_docker_service
         docker info >/dev/null
         return 0
     fi
@@ -591,7 +598,7 @@ install_docker() {
 
     apt-get update -qq
     apt-get install -y -qq --no-upgrade docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    systemctl enable --now docker >/dev/null
+    ensure_docker_service
     docker compose version >/dev/null
     docker info >/dev/null
 }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.5 — 2026-08-26
+
+- Start and enable `docker.socket` before `docker.service`, preventing the
+  `no sockets found via socket activation` failure on fresh Ubuntu VPS hosts.
+
 ## 1.0.4 — 2026-08-26
 
 - Exclude live iptables packet/byte counters from the effective-firewall drift

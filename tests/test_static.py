@@ -162,6 +162,18 @@ def test_invariants() -> None:
     for fragment in required_installer_fragments:
         if fragment not in installer:
             fail(f"installer invariant missing: {fragment}")
+    docker_service_helper = re.search(
+        r"ensure_docker_service\(\)\s*\{(?P<body>.*?)\n\}", installer, re.DOTALL
+    )
+    if docker_service_helper is None:
+        fail("Docker service startup helper is missing")
+    docker_service_body = docker_service_helper.group("body")
+    socket_start = docker_service_body.find("systemctl enable --now docker.socket")
+    service_start = docker_service_body.find("systemctl enable --now docker.service")
+    if socket_start < 0 or service_start < 0 or socket_start > service_start:
+        fail("docker.socket must start before docker.service")
+    if installer.count("ensure_docker_service") != 3:
+        fail("both Docker installation paths must use the service startup helper")
     required_status_fragments = [
         "listener_owned_by_remnanode udp",
         "compute_ufw_policy_hash",

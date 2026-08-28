@@ -251,10 +251,10 @@ create_recovery_attempt() {
     target_v6="$(normalized_iptables_restore_hash "${RECOVERY_ATTEMPT_DIR}/target-v6.restore")" || \
         die 'Unable to hash the target IPv6 recovery image'
     if [[ "$RECOVERY_SOURCE_VERSION" == '1.0.5' ]]; then
-        assert_v105_docker_only_restore_image "${RECOVERY_ATTEMPT_DIR}/target-v4.restore" 1 || \
+        assert_v105_docker_only_restore_image "${RECOVERY_ATTEMPT_DIR}/target-v4.restore" ipv4 || \
             die 'v1.0.5 IPv4 recovery target is not a pristine or exact empty-Docker policy'
-        assert_v105_docker_only_restore_image "${RECOVERY_ATTEMPT_DIR}/target-v6.restore" 0 || \
-            die 'v1.0.5 IPv6 recovery target is not pristine'
+        assert_v105_docker_only_restore_image "${RECOVERY_ATTEMPT_DIR}/target-v6.restore" ipv6 || \
+            die 'v1.0.5 IPv6 recovery target is not a pristine or exact empty-Docker policy'
         target_native="$(compute_isolated_native_hash \
             "${RECOVERY_ATTEMPT_DIR}/target-v4.restore" \
             "${RECOVERY_ATTEMPT_DIR}/target-v6.restore")" || \
@@ -307,14 +307,16 @@ restore_source_managed_files() {
 
 assert_v105_docker_only_restore_image() {
     local restore_file="$1"
-    local allow_docker_scaffold="$2"
+    local docker_scaffold_family="$2"
     [[ -f "$restore_file" && ! -L "$restore_file" ]] || return 1
-    [[ "$allow_docker_scaffold" == '0' || "$allow_docker_scaffold" == '1' ]] || return 2
+    [[ "$docker_scaffold_family" == 'none' || \
+       "$docker_scaffold_family" == 'ipv4' || \
+       "$docker_scaffold_family" == 'ipv6' ]] || return 2
     python3 -I -c '
 import re
 import sys
 
-path, allow_docker = sys.argv[1:3]
+path, docker_family = sys.argv[1:3]
 builtins = {
     "filter": {"INPUT", "FORWARD", "OUTPUT"},
     "nat": {"PREROUTING", "INPUT", "OUTPUT", "POSTROUTING"},
@@ -326,7 +328,7 @@ docker_filter_chains = {
     "DOCKER", "DOCKER-BRIDGE", "DOCKER-CT", "DOCKER-FORWARD",
     "DOCKER-INTERNAL", "DOCKER-USER",
 }
-docker_filter_rules = {
+docker_filter_rules_ipv4 = {
     "FORWARD": [
         "-A FORWARD -j DOCKER-USER",
         "-A FORWARD -j DOCKER-FORWARD",
@@ -343,12 +345,27 @@ docker_filter_rules = {
         "-A DOCKER-FORWARD -i docker0 -j ACCEPT",
     ],
 }
-docker_nat_rules = {
+docker_nat_rules_ipv4 = {
     "PREROUTING": ["-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER"],
     "OUTPUT": ["-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER"],
     "POSTROUTING": [
         "-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE"
     ],
+}
+docker_filter_rules_ipv6 = {
+    "FORWARD": [
+        "-A FORWARD -j DOCKER-USER",
+        "-A FORWARD -j DOCKER-FORWARD",
+    ],
+    "DOCKER-FORWARD": [
+        "-A DOCKER-FORWARD -j DOCKER-CT",
+        "-A DOCKER-FORWARD -j DOCKER-INTERNAL",
+        "-A DOCKER-FORWARD -j DOCKER-BRIDGE",
+    ],
+}
+docker_nat_rules_ipv6 = {
+    "PREROUTING": ["-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER"],
+    "OUTPUT": ["-A OUTPUT ! -d ::1/128 -m addrtype --dst-type LOCAL -j DOCKER"],
 }
 
 tables = {}
@@ -396,20 +413,28 @@ for table, data in tables.items():
         if any(chains[name] != "ACCEPT" for name in builtins[table]):
             raise SystemExit(2)
         continue
-    if allow_docker != "1":
+    if docker_family == "none":
         raise SystemExit(2)
-    if table == "filter" and custom == docker_filter_chains and rules == docker_filter_rules:
+    expected_filter_rules = (
+        docker_filter_rules_ipv4 if docker_family == "ipv4"
+        else docker_filter_rules_ipv6
+    )
+    expected_nat_rules = (
+        docker_nat_rules_ipv4 if docker_family == "ipv4"
+        else docker_nat_rules_ipv6
+    )
+    if table == "filter" and custom == docker_filter_chains and rules == expected_filter_rules:
         if chains["INPUT"] != "ACCEPT" or chains["OUTPUT"] != "ACCEPT":
             raise SystemExit(2)
         if chains["FORWARD"] not in {"ACCEPT", "DROP"}:
             raise SystemExit(2)
         continue
-    if table == "nat" and custom == {"DOCKER"} and rules == docker_nat_rules:
+    if table == "nat" and custom == {"DOCKER"} and rules == expected_nat_rules:
         if any(chains[name] != "ACCEPT" for name in builtins[table]):
             raise SystemExit(2)
         continue
     raise SystemExit(2)
-' "$restore_file" "$allow_docker_scaffold"
+' "$restore_file" "$docker_scaffold_family"
 }
 
 assert_pristine_secondary_legacy_backends() {
@@ -426,7 +451,7 @@ assert_pristine_secondary_legacy_backends() {
         command -v "$command_name" >/dev/null 2>&1 || return 1
         temporary="$(mktemp)" || return 1
         if ! "$command_name" >"$temporary" || \
-            ! assert_v105_docker_only_restore_image "$temporary" 0; then
+            ! assert_v105_docker_only_restore_image "$temporary" none; then
             rm -f -- "$temporary"
             return 1
         fi

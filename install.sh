@@ -14,7 +14,7 @@ unset PYTHONHOME PYTHONPATH CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
 unset GNUPGHOME APT_CONFIG GIT_CONFIG_COUNT
 unset SECRET_KEY
 
-readonly INSTALLER_VERSION='1.0.6'
+readonly INSTALLER_VERSION='1.0.7'
 readonly CONFIG_SCHEMA_VERSION='1'
 readonly MANAGED_BY='remnawave-node-bootstrap'
 readonly INSTALL_DIR='/opt/remnanode'
@@ -1364,7 +1364,7 @@ if table is not None:
     raise SystemExit(2)
 PY
         then
-            die "Pre-existing ${command_name} firewall rules detected; use --external-firewall"
+            return 1
         fi
     done
 
@@ -1392,9 +1392,76 @@ if text.strip():
     raise SystemExit(2)
 PY
         then
-            die 'Pre-existing native nftables rules detected; use --external-firewall'
+            return 1
         fi
     fi
+}
+
+matches_recovered_fresh_firewall_baseline() {
+    # A failed first run may have installed Docker before the managed
+    # transaction was rolled back. Keep Docker installed, but trust its
+    # remaining firewall scaffolding only when it is byte-policy-equivalent to
+    # a root-only fresh-install baseline that this bootstrap has just marked
+    # ROLLED_BACK. Arbitrary pre-existing rules and any Docker container still
+    # fail closed.
+    docker_daemon_available || return 1
+    local inventory
+    inventory="$(docker_inventory_snapshot)" || return 1
+    [[ -z "$inventory" ]] || return 1
+    ! docker inspect remnanode >/dev/null 2>&1 || return 1
+    [[ -d "$BACKUP_ROOT" && ! -L "$BACKUP_ROOT" && \
+        "$(stat -c '%u:%g:%a' -- "$BACKUP_ROOT")" == '0:0:700' ]] || return 1
+
+    local current_effective current_ufw marker state transaction metadata manifest
+    local source_version had_install previous_present previous_active expected_effective expected_ufw
+    current_effective="$(compute_effective_firewall_hash)" || return 1
+    current_ufw="$(compute_ufw_policy_hash)" || return 1
+    while IFS= read -r -d '' marker; do
+        [[ -f "$marker" && ! -L "$marker" && \
+            "$(stat -c '%u:%g:%a' -- "$marker")" == '0:0:600' ]] || continue
+        state="$(<"$marker")"
+        [[ "$state" == 'ROLLED_BACK' ]] || continue
+        transaction="$(dirname -- "$marker")"
+        [[ "$(dirname -- "$transaction")" == "$BACKUP_ROOT" && \
+            -d "$transaction" && ! -L "$transaction" && \
+            "$(stat -c '%u:%g:%a' -- "$transaction")" == '0:0:700' ]] || continue
+        metadata="${transaction}/metadata"
+        manifest="${transaction}/managed-files.manifest"
+        [[ -f "$metadata" && ! -L "$metadata" && \
+            "$(stat -c '%u:%g:%a' -- "$metadata")" == '0:0:600' && \
+            -f "$manifest" && ! -L "$manifest" && \
+            "$(stat -c '%u:%g:%a' -- "$manifest")" == '0:0:600' ]] || continue
+
+        source_version="$(read_setting installer_version "$metadata")"
+        had_install="$(read_setting had_managed_install "$metadata")"
+        previous_present="$(read_setting previous_container_present "$metadata")"
+        previous_active="$(read_setting ufw_previous_active "$metadata")"
+        expected_effective="$(read_setting effective_firewall_hash "$metadata")"
+        expected_ufw="$(read_setting ufw_policy_hash "$metadata")"
+        [[ "$source_version" == '1.0.5' || "$source_version" == '1.0.6' || "$source_version" == '1.0.7' ]] || continue
+        [[ "$had_install" == '0' && "$previous_present" == '0' && "$previous_active" == '0' ]] || continue
+        [[ "$expected_effective" =~ ^[a-f0-9]{64}$ && "$expected_effective" == "$current_effective" ]] || continue
+        [[ "$expected_ufw" =~ ^[a-f0-9]{64}$ && "$expected_ufw" == "$current_ufw" ]] || continue
+        [[ "$(wc -l <"$manifest")" -eq 3 ]] || continue
+
+        local destination record presence
+        local all_missing=1
+        for destination in "$COMPOSE_FILE" "$ENV_FILE" "$BOOTSTRAP_CONFIG"; do
+            record="$(manifest_record_for_path "$manifest" "$destination")" || {
+                all_missing=0
+                break
+            }
+            IFS=$'\t' read -r presence _ <<<"$record"
+            [[ "$presence" == 'missing' ]] || {
+                all_missing=0
+                break
+            }
+        done
+        (( all_missing == 1 )) || continue
+        info "Accepted exact firewall baseline from recovered transaction: ${transaction}"
+        return 0
+    done < <(find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -name transaction.state -print0)
+    return 1
 }
 
 preflight_firewall() {
@@ -1428,7 +1495,10 @@ preflight_firewall() {
         ! grep -q '^ufw ' <<<"$added" || \
             die 'Inactive UFW has latent rules; reconcile them and use --external-firewall'
         assert_pristine_ufw_conffiles
-        assert_clean_effective_input_rules
+        if ! assert_clean_effective_input_rules; then
+            matches_recovered_fresh_firewall_baseline || \
+                die 'Pre-existing firewall rules do not match a verified recovered baseline; use --external-firewall only after configuring it yourself'
+        fi
     fi
 }
 

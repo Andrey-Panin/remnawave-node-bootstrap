@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.7 — 2026-08-28
+
+- Allow a fresh retry to retain Docker's installed firewall scaffolding only
+  when the empty Docker inventory and both live firewall hashes exactly match
+  a root-only transaction already marked `ROLLED_BACK` by `recover.sh`.
+- Keep arbitrary pre-existing firewall rules and all foreign containers
+  fail-closed; `--external-firewall` remains an explicit operator choice.
+
 ## 1.0.6 — 2026-08-28
 
 - Exclude only the upstream-owned dynamic nftables tables `ip remnanode` and

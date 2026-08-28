@@ -160,6 +160,7 @@ def test_invariants() -> None:
         "docker compose",
         "trap on_exit EXIT",
         "filter_managed_node_nft_tables",
+        "matches_recovered_fresh_firewall_baseline",
         "firewall-restore-v4.txt",
         "write_firewall_evidence after-node",
     ]

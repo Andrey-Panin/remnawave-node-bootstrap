@@ -103,8 +103,9 @@ load_and_verify_legacy_transaction() {
     SNAPSHOT_UFW_POLICY_HASH="$(read_setting ufw_policy_hash "$metadata")"
     SNAPSHOT_EFFECTIVE_FIREWALL_HASH="$(read_setting effective_firewall_hash "$metadata")"
 
-    [[ "$RECOVERY_SOURCE_VERSION" == '1.0.5' || "$RECOVERY_SOURCE_VERSION" == '1.0.6' ]] || \
-        die "Recovery supports transaction versions 1.0.5/1.0.6; got ${RECOVERY_SOURCE_VERSION:-missing}"
+    [[ "$RECOVERY_SOURCE_VERSION" == '1.0.5' || "$RECOVERY_SOURCE_VERSION" == '1.0.6' || \
+        "$RECOVERY_SOURCE_VERSION" == '1.0.7' ]] || \
+        die "Recovery supports transaction versions 1.0.5/1.0.6/1.0.7; got ${RECOVERY_SOURCE_VERSION:-missing}"
     [[ "$had_install" == '0' && "$previous_present" == '0' && "$previous_running" == '0' ]] || \
         die 'This recovery tool intentionally supports only a failed fresh install with no previous node'
     [[ "$UFW_PREVIOUS_ACTIVE" == '0' ]] || die 'The failed fresh install did not start from inactive UFW'
@@ -117,7 +118,7 @@ load_and_verify_legacy_transaction() {
     verify_ufw_backup_integrity || die 'UFW-file backup integrity verification failed'
     [[ "$(compute_ufw_backup_policy_hash)" == "$SNAPSHOT_UFW_POLICY_HASH" ]] || \
         die 'UFW backup policy does not match transaction metadata'
-    if [[ "$RECOVERY_SOURCE_VERSION" == '1.0.6' ]]; then
+    if [[ "$RECOVERY_SOURCE_VERSION" == '1.0.6' || "$RECOVERY_SOURCE_VERSION" == '1.0.7' ]]; then
         SNAPSHOT_FIREWALL_V4_HASH="$(read_setting firewall_restore_v4_hash "$metadata")"
         SNAPSHOT_FIREWALL_V6_HASH="$(read_setting firewall_restore_v6_hash "$metadata")"
         SNAPSHOT_HOST_FIREWALL_EVIDENCE_HASH="$(read_setting firewall_host_evidence_hash "$metadata")"
@@ -212,7 +213,7 @@ create_recovery_attempt() {
     fi
     (( RECOVERY_INITIAL_CONTAINER_RUNNING == 0 )) || die 'Fail-closed recovery requires remnanode to be stopped before it starts'
 
-    if [[ "$RECOVERY_SOURCE_VERSION" == '1.0.6' ]]; then
+    if [[ "$RECOVERY_SOURCE_VERSION" == '1.0.6' || "$RECOVERY_SOURCE_VERSION" == '1.0.7' ]]; then
         cp -a -- "${BACKUP_DIR}/firewall-restore-v4.txt" "${RECOVERY_ATTEMPT_DIR}/target-v4.restore"
         cp -a -- "${BACKUP_DIR}/firewall-restore-v6.txt" "${RECOVERY_ATTEMPT_DIR}/target-v6.restore"
     else

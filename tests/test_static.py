@@ -144,6 +144,7 @@ def test_detectors() -> None:
 
 def test_invariants() -> None:
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    recovery = (ROOT / "recover.sh").read_text(encoding="utf-8")
     status = (ROOT / "status.sh").read_text(encoding="utf-8")
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -158,6 +159,9 @@ def test_invariants() -> None:
         "primary_fingerprints",
         "docker compose",
         "trap on_exit EXIT",
+        "filter_managed_node_nft_tables",
+        "firewall-restore-v4.txt",
+        "write_firewall_evidence after-node",
     ]
     for fragment in required_installer_fragments:
         if fragment not in installer:
@@ -174,6 +178,27 @@ def test_invariants() -> None:
         fail("docker.socket must start before docker.service")
     if installer.count("ensure_docker_service") != 3:
         fail("both Docker installation paths must use the service startup helper")
+    rollback_helper = re.search(
+        r"rollback\(\)\s*\{(?P<body>.*?)\n\}", installer, re.DOTALL
+    )
+    if rollback_helper is None:
+        fail("rollback helper is missing")
+    rollback_body = rollback_helper.group("body")
+    stop_position = rollback_body.find("stop_current_managed_container")
+    firewall_position = rollback_body.find("restore_firewall_snapshot")
+    if stop_position < 0 or firewall_position < 0 or stop_position > firewall_position:
+        fail("rollback must stop the NET_ADMIN container before restoring firewall state")
+    required_recovery_fragments = [
+        "Type RECOVER",
+        "ROLLBACK_INCOMPLETE",
+        "filter_inactive_ufw_iptables_save",
+        "sha256sum --check --status",
+        "restore_recovery_attempt",
+        "verify_recovered_source_state",
+    ]
+    for fragment in required_recovery_fragments:
+        if fragment not in recovery:
+            fail(f"recovery invariant missing: {fragment}")
     required_status_fragments = [
         "listener_owned_by_remnanode udp",
         "compute_ufw_policy_hash",
@@ -203,6 +228,7 @@ def test_invariants() -> None:
     required_readme_fragments = [
         "https://github.com/Andrey-Panin/remnawave-node-bootstrap.git",
         "cd remnawave-node-bootstrap",
+        "sudo bash recover.sh",
     ]
     for fragment in required_readme_fragments:
         if fragment not in readme:
@@ -216,7 +242,7 @@ def test_shell_syntax() -> None:
     if not bash:
         fail("bash executable not found")
     subprocess.run(
-        [bash, "-n", "install.sh", "status.sh", "tests/test_functions.sh"],
+        [bash, "-n", "install.sh", "recover.sh", "status.sh", "tests/test_functions.sh"],
         cwd=ROOT,
         check=True,
     )

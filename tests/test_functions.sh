@@ -61,6 +61,21 @@ normalized_policy_change="$(normalize_iptables_save <<<"$iptables_policy_change"
 [[ "$normalized_a" == "$normalized_b" ]]
 [[ "$normalized_a" != "$normalized_policy_change" ]]
 
+nft_with_managed_tables=$'table ip filter {\n\tchain INPUT {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\ntable ip remnanode {\n\tset ingress-filter-ip {\n\t\ttype ipv4_addr\n\t}\n}\ntable ip6 remnanode6 {\n\tchain output {\n\t\ttype filter hook output priority -10; policy accept;\n\t}\n}\ntable ip remnanode-shadow {\n\tchain input {\n\t}\n}'
+nft_without_managed_tables="$(filter_managed_node_nft_tables <<<"$nft_with_managed_tables")"
+[[ "$nft_without_managed_tables" == *'table ip filter {'* ]]
+[[ "$nft_without_managed_tables" == *'table ip remnanode-shadow {'* ]]
+[[ "$nft_without_managed_tables" != *'table ip remnanode {'* ]]
+[[ "$nft_without_managed_tables" != *'table ip6 remnanode6 {'* ]]
+expect_failure filter_managed_node_nft_tables <<<'table ip remnanode {'
+
+iptables_with_ufw=$'*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n:DOCKER-USER - [0:0]\n:ufw-before-input - [0:0]\n:ufw6-before-input - [0:0]\n-A INPUT -j ufw-before-input\n-A FORWARD -j DOCKER-USER\n-A ufw-before-input -s 1.2.3.4 -j ACCEPT\n-A ufw6-before-input -j ACCEPT\nCOMMIT'
+iptables_without_ufw="$(filter_inactive_ufw_iptables_save <<<"$iptables_with_ufw")"
+[[ "$iptables_without_ufw" == *':DOCKER-USER - [0:0]'* ]]
+[[ "$iptables_without_ufw" == *'-A FORWARD -j DOCKER-USER'* ]]
+[[ "$iptables_without_ufw" != *'ufw-before-input'* ]]
+[[ "$iptables_without_ufw" != *'ufw6-before-input'* ]]
+
 tmp="$(mktemp)"
 trap 'rm -f -- "$tmp"' EXIT
 printf 'A=one\nSECRET_KEY=abc=def==\n' >"$tmp"

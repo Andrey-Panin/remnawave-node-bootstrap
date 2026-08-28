@@ -21,7 +21,7 @@
 Запустите на новом Ubuntu VPS от пользователя с `sudo`:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git && git clone --branch v1.0.5 --depth 1 https://github.com/Andrey-Panin/remnawave-node-bootstrap.git
+sudo apt-get update && sudo apt-get install -y git && git clone --branch v1.0.6 --depth 1 https://github.com/Andrey-Panin/remnawave-node-bootstrap.git
 cd remnawave-node-bootstrap
 sudo bash install.sh
 ```
@@ -93,8 +93,12 @@ sudo bash install.sh --external-firewall
 по тем же правилам.
 
 После первой управляемой установки сохраняется hash всех значимых UFW policy
-files и эффективного iptables/nftables ruleset. Если их изменит другой
-инструмент, повторный запуск остановится и не будет перетирать чужую политику.
+files и системной части эффективного iptables/nftables ruleset. Две точные
+таблицы приложения — `ip remnanode` и `ip6 remnanode6` — создаются самой Node,
+меняются её плагинами и поэтому не входят в hash системного firewall. Все другие
+таблицы, цепочки, политики и правила продолжают контролироваться. Root-only
+backup также содержит исходные IPv4/IPv6 restore images и снимки ruleset до
+UFW, после UFW и после запуска Node.
 
 ## Транзакция и откат
 
@@ -108,8 +112,17 @@ files и эффективного iptables/nftables ruleset. Если их из�
 При обычной ошибке или `Ctrl+C` восстанавливаются точные файлы, UFW state и
 предыдущее состояние контейнера (отсутствовал/running/stopped). Ошибка самого
 отката возвращает отдельный exit code `70`, оставляет
-`ROLLBACK_INCOMPLETE` и блокирует повторный запуск до ручной сверки. Это лучше,
-чем скрыто продолжить с частично восстановленной системой.
+`ROLLBACK_INCOMPLETE` и блокирует повторный запуск до сверки. Для незавершённой
+первой установки без прежней ноды используется отдельный fail-closed recovery:
+
+```bash
+sudo bash recover.sh
+```
+
+Recovery проверяет root-only backup, показывает план и ждёт слово `RECOVER`.
+Перед изменением он сохраняет ещё один снимок текущих файлов и firewall. Если
+восстановленный ruleset не совпадёт с исходным hash, состояние до попытки
+recovery возвращается, а unresolved marker сохраняется.
 
 Установленные OS/Docker packages не удаляются при rollback. Сбой питания или
 `SIGKILL` может прервать процесс без обработчика; сохранённый `APPLYING` marker

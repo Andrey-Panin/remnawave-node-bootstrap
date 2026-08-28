@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.6 — 2026-08-28
+
+- Exclude only the upstream-owned dynamic nftables tables `ip remnanode` and
+  `ip6 remnanode6` from the host-firewall drift hash.
+- Stop the NET_ADMIN container before restoring or verifying firewall state.
+- Save verified IPv4/IPv6 restore images and before/after firewall evidence in
+  every managed transaction backup.
+- Restore exact runtime firewall images instead of relying on `ufw disable` to
+  remove its inactive chain scaffolding.
+- Add `recover.sh` for fail-closed reconciliation of a failed fresh-install
+  transaction from bootstrap 1.0.5/1.0.6.
+
 ## 1.0.5 — 2026-08-26
 
 - Start and enable `docker.socket` before `docker.service`, preventing the

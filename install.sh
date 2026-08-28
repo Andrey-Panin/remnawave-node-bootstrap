@@ -14,7 +14,7 @@ unset PYTHONHOME PYTHONPATH CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
 unset GNUPGHOME APT_CONFIG GIT_CONFIG_COUNT
 unset SECRET_KEY
 
-readonly INSTALLER_VERSION='1.0.5'
+readonly INSTALLER_VERSION='1.0.6'
 readonly CONFIG_SCHEMA_VERSION='1'
 readonly MANAGED_BY='remnawave-node-bootstrap'
 readonly INSTALL_DIR='/opt/remnanode'
@@ -27,6 +27,8 @@ readonly LOCK_FILE="${LOCK_DIR}/installer.lock"
 readonly NODE_IMAGE='remnawave/node:3.3.2@sha256:50708731676b87b239f3dff8c40f2c62ff88fbbba216bacfb0f683dcaf467763'
 readonly DOCKER_GPG_FINGERPRINT='9DC858229FC7DD38854AE2D88D81803C0EBFCD88'
 readonly ROLLBACK_FAILURE_EXIT=70
+readonly NODE_NFT_IPV4_TABLE='remnanode'
+readonly NODE_NFT_IPV6_TABLE='remnanode6'
 
 PANEL_IP=''
 NODE_PORT='2222'
@@ -62,6 +64,10 @@ SNAPSHOT_CONTAINER_MARKER=''
 SNAPSHOT_DOCKER_INVENTORY_HASH=''
 SNAPSHOT_MANAGED_MANIFEST_HASH=''
 SNAPSHOT_UFW_MANIFEST_HASH=''
+SNAPSHOT_FIREWALL_V4_HASH=''
+SNAPSHOT_FIREWALL_V6_HASH=''
+SNAPSHOT_HOST_FIREWALL_EVIDENCE_HASH=''
+SNAPSHOT_RAW_FIREWALL_EVIDENCE_HASH=''
 
 BACKUP_DIR=''
 BACKUP_COMPLETE=0
@@ -694,7 +700,57 @@ normalize_iptables_save() {
         -e 's/\[[0-9]+:[0-9]+\]/[0:0]/g'
 }
 
-effective_firewall_snapshot() {
+filter_inactive_ufw_iptables_save() {
+    # A fresh managed installation accepts only a pristine inactive UFW and a
+    # pristine runtime firewall. If that installation is rolled back, remove
+    # only the UFW chains and jumps introduced by the failed activation while
+    # retaining Docker's independently managed chains verbatim.
+    python3 -I -c '
+import re
+import sys
+
+chain = re.compile(r"^:(?:ufw|ufw6)-[^ ]+\s")
+owned_rule = re.compile(r"^-[AI]\s+(?:ufw|ufw6)-[^ ]+(?:\s|$)")
+jump = re.compile(r"(?:^|\s)-(?:j|g)\s+(?:ufw|ufw6)-[^ ]+(?:\s|$)")
+for line in sys.stdin:
+    stripped = line.rstrip("\n")
+    if chain.search(stripped) or owned_rule.search(stripped) or jump.search(stripped):
+        continue
+    sys.stdout.write(line)
+'
+}
+
+filter_managed_node_nft_tables() {
+    # Remnawave Node 3.3.2 creates these two native nftables tables whenever
+    # it has CAP_NET_ADMIN and deletes them during graceful shutdown. Their
+    # sets and counters are application runtime state, not the host ACL owned
+    # by this bootstrap. Exclude only the exact upstream-owned table names.
+    python3 -I -c '
+import re
+import sys
+
+ipv4_name, ipv6_name = sys.argv[1:3]
+target = re.compile(
+    r"^\s*table\s+(?:ip\s+" + re.escape(ipv4_name)
+    + r"|ip6\s+" + re.escape(ipv6_name) + r")\s*\{\s*$"
+)
+depth = 0
+for line in sys.stdin:
+    if depth:
+        depth += line.count("{") - line.count("}")
+        if depth < 0:
+            raise SystemExit(2)
+        continue
+    if target.fullmatch(line.rstrip("\n")):
+        depth = 1
+        continue
+    sys.stdout.write(line)
+if depth:
+    raise SystemExit(2)
+' "$NODE_NFT_IPV4_TABLE" "$NODE_NFT_IPV6_TABLE"
+}
+
+iptables_firewall_snapshot() {
     local command_name output
     local -a save_commands=(iptables-save ip6tables-save)
     [[ -s /proc/net/ip_tables_names ]] && save_commands+=(iptables-legacy-save)
@@ -708,6 +764,11 @@ effective_firewall_snapshot() {
             printf 'missing\n'
         fi
     done
+}
+
+raw_effective_firewall_snapshot() {
+    local output
+    iptables_firewall_snapshot || return 1
     printf '### nft stateless ruleset\n'
     if command -v nft >/dev/null 2>&1; then
         output="$(nft --stateless list ruleset 2>/dev/null)" || return 1
@@ -717,8 +778,46 @@ effective_firewall_snapshot() {
     fi
 }
 
+effective_firewall_snapshot() {
+    local output
+    iptables_firewall_snapshot || return 1
+    printf '### nft stateless ruleset\n'
+    if command -v nft >/dev/null 2>&1; then
+        output="$(nft --stateless list ruleset 2>/dev/null)" || return 1
+        filter_managed_node_nft_tables <<<"$output" || return 1
+    else
+        printf 'missing\n'
+    fi
+}
+
 compute_effective_firewall_hash() {
     effective_firewall_snapshot | sha256sum | awk '{print $1}'
+}
+
+write_firewall_evidence() {
+    local stage="$1"
+    [[ "$stage" =~ ^[a-z0-9-]+$ ]] || return 1
+    [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" && ! -L "$BACKUP_DIR" ]] || return 1
+
+    local host_file="${BACKUP_DIR}/firewall-host-${stage}.txt"
+    local raw_file="${BACKUP_DIR}/firewall-raw-${stage}.txt"
+    local host_tmp raw_tmp
+    [[ ! -e "$host_file" && ! -L "$host_file" && ! -e "$raw_file" && ! -L "$raw_file" ]] || return 1
+    host_tmp="$(mktemp "${BACKUP_DIR}/firewall-host-${stage}.new.XXXXXX")" || return 1
+    raw_tmp="$(mktemp "${BACKUP_DIR}/firewall-raw-${stage}.new.XXXXXX")" || {
+        rm -f -- "$host_tmp"
+        return 1
+    }
+    if ! effective_firewall_snapshot >"$host_tmp" || \
+        ! raw_effective_firewall_snapshot >"$raw_tmp" || \
+        ! chmod 0600 "$host_tmp" "$raw_tmp" || \
+        ! sync "$host_tmp" "$raw_tmp" || \
+        ! mv -fT -- "$host_tmp" "$host_file" || \
+        ! mv -fT -- "$raw_tmp" "$raw_file" || \
+        ! sync "$BACKUP_DIR"; then
+        rm -f -- "$host_tmp" "$raw_tmp"
+        return 1
+    fi
 }
 
 snapshot_firewall_and_complete_backup() {
@@ -764,9 +863,31 @@ snapshot_firewall_and_complete_backup() {
     SNAPSHOT_UFW_POLICY_HASH="$(compute_ufw_backup_policy_hash)" || \
         die 'Unable to derive the firewall policy hash from its backup manifest'
     printf 'ufw_policy_hash=%s\n' "$SNAPSHOT_UFW_POLICY_HASH" >>"${BACKUP_DIR}/metadata"
-    SNAPSHOT_EFFECTIVE_FIREWALL_HASH="$(compute_effective_firewall_hash)" || \
-        die 'Unable to snapshot the effective firewall ruleset'
-    printf 'effective_firewall_hash=%s\n' "$SNAPSHOT_EFFECTIVE_FIREWALL_HASH" >>"${BACKUP_DIR}/metadata"
+
+    if [[ "$FIREWALL_MODE" == 'ufw' ]]; then
+        iptables-save >"${BACKUP_DIR}/firewall-restore-v4.txt" || \
+            die 'Unable to save the IPv4 firewall restore image'
+        ip6tables-save >"${BACKUP_DIR}/firewall-restore-v6.txt" || \
+            die 'Unable to save the IPv6 firewall restore image'
+        chmod 0600 "${BACKUP_DIR}/firewall-restore-v4.txt" "${BACKUP_DIR}/firewall-restore-v6.txt"
+        SNAPSHOT_FIREWALL_V4_HASH="$(sha256sum -- "${BACKUP_DIR}/firewall-restore-v4.txt" | awk '{print $1}')"
+        SNAPSHOT_FIREWALL_V6_HASH="$(sha256sum -- "${BACKUP_DIR}/firewall-restore-v6.txt" | awk '{print $1}')"
+    else
+        SNAPSHOT_FIREWALL_V4_HASH='external'
+        SNAPSHOT_FIREWALL_V6_HASH='external'
+    fi
+    printf 'firewall_restore_v4_hash=%s\n' "$SNAPSHOT_FIREWALL_V4_HASH" >>"${BACKUP_DIR}/metadata"
+    printf 'firewall_restore_v6_hash=%s\n' "$SNAPSHOT_FIREWALL_V6_HASH" >>"${BACKUP_DIR}/metadata"
+
+    write_firewall_evidence before || die 'Unable to persist the initial firewall evidence'
+    SNAPSHOT_HOST_FIREWALL_EVIDENCE_HASH="$(sha256sum -- "${BACKUP_DIR}/firewall-host-before.txt" | awk '{print $1}')"
+    SNAPSHOT_RAW_FIREWALL_EVIDENCE_HASH="$(sha256sum -- "${BACKUP_DIR}/firewall-raw-before.txt" | awk '{print $1}')"
+    SNAPSHOT_EFFECTIVE_FIREWALL_HASH="$SNAPSHOT_HOST_FIREWALL_EVIDENCE_HASH"
+    {
+        printf 'effective_firewall_hash=%s\n' "$SNAPSHOT_EFFECTIVE_FIREWALL_HASH"
+        printf 'firewall_host_evidence_hash=%s\n' "$SNAPSHOT_HOST_FIREWALL_EVIDENCE_HASH"
+        printf 'firewall_raw_evidence_hash=%s\n' "$SNAPSHOT_RAW_FIREWALL_EVIDENCE_HASH"
+    } >>"${BACKUP_DIR}/metadata"
 
     verify_backup_integrity || die 'Completed backup failed its integrity manifest verification'
     local sync_path
@@ -775,9 +896,14 @@ snapshot_firewall_and_complete_backup() {
         "${BACKUP_DIR}/managed-files.manifest" \
         "${BACKUP_DIR}/ufw-files.manifest" \
         "${BACKUP_DIR}/runtime-baseline.txt" \
-        "${BACKUP_DIR}/container-summary.txt"; do
+        "${BACKUP_DIR}/container-summary.txt" \
+        "${BACKUP_DIR}/firewall-host-before.txt" \
+        "${BACKUP_DIR}/firewall-raw-before.txt"; do
         sync "$sync_path"
     done
+    if [[ "$FIREWALL_MODE" == 'ufw' ]]; then
+        sync "${BACKUP_DIR}/firewall-restore-v4.txt" "${BACKUP_DIR}/firewall-restore-v6.txt"
+    fi
     sync -f "$BACKUP_DIR"
     write_transaction_state PREPARED
     BACKUP_COMPLETE=1
@@ -830,8 +956,38 @@ verify_live_ufw_snapshot() {
     done < <(ufw_policy_files)
 }
 
+verify_firewall_backup_integrity() {
+    local host_file="${BACKUP_DIR}/firewall-host-before.txt"
+    local raw_file="${BACKUP_DIR}/firewall-raw-before.txt"
+    local path
+    for path in "$host_file" "$raw_file"; do
+        [[ -f "$path" && ! -L "$path" && "$(stat -c '%u:%g:%a' -- "$path")" == '0:0:600' ]] || return 1
+    done
+    [[ "$SNAPSHOT_HOST_FIREWALL_EVIDENCE_HASH" =~ ^[a-f0-9]{64}$ && \
+        "$(sha256sum -- "$host_file" | awk '{print $1}')" == "$SNAPSHOT_HOST_FIREWALL_EVIDENCE_HASH" ]] || return 1
+    [[ "$SNAPSHOT_RAW_FIREWALL_EVIDENCE_HASH" =~ ^[a-f0-9]{64}$ && \
+        "$(sha256sum -- "$raw_file" | awk '{print $1}')" == "$SNAPSHOT_RAW_FIREWALL_EVIDENCE_HASH" ]] || return 1
+    [[ "$SNAPSHOT_EFFECTIVE_FIREWALL_HASH" == "$SNAPSHOT_HOST_FIREWALL_EVIDENCE_HASH" ]] || return 1
+
+    if [[ "$FIREWALL_MODE" == 'ufw' ]]; then
+        local v4_file="${BACKUP_DIR}/firewall-restore-v4.txt"
+        local v6_file="${BACKUP_DIR}/firewall-restore-v6.txt"
+        for path in "$v4_file" "$v6_file"; do
+            [[ -f "$path" && ! -L "$path" && "$(stat -c '%u:%g:%a' -- "$path")" == '0:0:600' ]] || return 1
+        done
+        [[ "$SNAPSHOT_FIREWALL_V4_HASH" =~ ^[a-f0-9]{64}$ && \
+            "$(sha256sum -- "$v4_file" | awk '{print $1}')" == "$SNAPSHOT_FIREWALL_V4_HASH" ]] || return 1
+        [[ "$SNAPSHOT_FIREWALL_V6_HASH" =~ ^[a-f0-9]{64}$ && \
+            "$(sha256sum -- "$v6_file" | awk '{print $1}')" == "$SNAPSHOT_FIREWALL_V6_HASH" ]] || return 1
+    else
+        [[ "$SNAPSHOT_FIREWALL_V4_HASH" == 'external' && "$SNAPSHOT_FIREWALL_V6_HASH" == 'external' ]] || return 1
+    fi
+}
+
 verify_backup_integrity() {
-    verify_managed_backup_integrity && verify_ufw_backup_integrity
+    verify_managed_backup_integrity && \
+        verify_ufw_backup_integrity && \
+        verify_firewall_backup_integrity
 }
 
 container_pids() {
@@ -1485,8 +1641,8 @@ configure_firewall() {
     fi
     verify_ufw_policy
     CURRENT_UFW_POLICY_HASH="$(compute_ufw_policy_hash)"
-    CURRENT_EFFECTIVE_FIREWALL_HASH="$(compute_effective_firewall_hash)" || \
-        die 'Unable to record the effective managed firewall ruleset'
+    write_firewall_evidence after-ufw || die 'Unable to record firewall evidence after UFW configuration'
+    CURRENT_EFFECTIVE_FIREWALL_HASH="$(sha256sum -- "${BACKUP_DIR}/firewall-host-after-ufw.txt" | awk '{print $1}')"
 }
 
 record_rollback_error() {
@@ -1510,6 +1666,27 @@ restore_file_atomically() {
         ! file_matches_metadata "$temporary" "$mode" "$uid" "$gid" "$size" "$hash" || \
         ! sync "$temporary" || ! mv -fT -- "$temporary" "$destination" || ! sync "$parent"; then
         rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+restore_iptables_images() {
+    local v4_file="${BACKUP_DIR}/firewall-restore-v4.txt"
+    local v6_file="${BACKUP_DIR}/firewall-restore-v6.txt"
+    if ! iptables-restore --wait 5 --test <"$v4_file"; then
+        record_rollback_error 'saved IPv4 firewall image failed validation'
+        return 1
+    fi
+    if ! ip6tables-restore --wait 5 --test <"$v6_file"; then
+        record_rollback_error 'saved IPv6 firewall image failed validation'
+        return 1
+    fi
+    if ! iptables-restore --wait 5 <"$v4_file"; then
+        record_rollback_error 'failed to restore the exact IPv4 firewall image'
+        return 1
+    fi
+    if ! ip6tables-restore --wait 5 <"$v6_file"; then
+        record_rollback_error 'failed to restore the exact IPv6 firewall image'
         return 1
     fi
 }
@@ -1539,17 +1716,7 @@ restore_firewall_snapshot() {
         esac
     done <"${BACKUP_DIR}/ufw-files.manifest"
 
-    if (( UFW_PREVIOUS_ACTIVE == 1 )); then
-        if ! LC_ALL=C ufw --force enable >/dev/null 2>&1; then
-            record_rollback_error 'failed to re-enable previous UFW state'
-        elif ! LC_ALL=C ufw reload >/dev/null 2>&1; then
-            record_rollback_error 'failed to reload restored UFW policy'
-        fi
-    else
-        if ! LC_ALL=C ufw --force disable >/dev/null 2>&1; then
-            record_rollback_error 'failed to restore inactive UFW state'
-        fi
-    fi
+    restore_iptables_images || true
     local active_now=0
     LC_ALL=C ufw status 2>/dev/null | head -n 1 | grep -q '^Status: active$' && active_now=1
     if (( active_now != UFW_PREVIOUS_ACTIVE )); then
@@ -1675,18 +1842,25 @@ rollback() {
         record_rollback_error 'backup integrity verification failed; no restore actions were attempted'
         return 1
     fi
+    local stop_errors_before=${#ROLLBACK_ERRORS[@]}
+    stop_current_managed_container
+    if (( ${#ROLLBACK_ERRORS[@]} > stop_errors_before )); then
+        # A running NET_ADMIN container may continue changing its native
+        # nftables tables. Do not weaken or restore the host ACL until it is
+        # proven stopped.
+        sync_restored_state
+        warn 'Node shutdown could not be proven; current firewall remains in place and rollback is fail-closed'
+        return 1
+    fi
+
     local firewall_errors_before=${#ROLLBACK_ERRORS[@]}
     restore_firewall_snapshot
     if (( ${#ROLLBACK_ERRORS[@]} > firewall_errors_before )); then
-        # Never restart the previous node while its Panel-only firewall ACL is
-        # uncertain. Stop the current node and leave the durable unresolved
-        # marker and root-only backup for manual reconciliation.
-        stop_current_managed_container
         sync_restored_state
         warn 'Firewall rollback could not be proven; node remains stopped and rollback is fail-closed'
         return 1
     fi
-    stop_current_managed_container
+
     restore_managed_files
     restore_container_state
     sync_restored_state
@@ -1754,7 +1928,9 @@ main() {
         verify_ufw_policy
         [[ "$(compute_ufw_policy_hash)" == "$CURRENT_UFW_POLICY_HASH" ]] || \
             die 'Managed UFW files drifted before completion'
-        [[ "$(compute_effective_firewall_hash)" == "$CURRENT_EFFECTIVE_FIREWALL_HASH" ]] || \
+        write_firewall_evidence after-node || die 'Unable to record firewall evidence after Node startup'
+        [[ "$(sha256sum -- "${BACKUP_DIR}/firewall-host-after-node.txt" | awk '{print $1}')" == \
+            "$CURRENT_EFFECTIVE_FIREWALL_HASH" ]] || \
             die 'Effective firewall rules drifted before completion'
     fi
     rewrite_bootstrap_config_with_policy_hash

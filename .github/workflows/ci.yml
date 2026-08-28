@@ -23,10 +23,10 @@ jobs:
           sudo apt-get install --yes shellcheck
 
       - name: Shell syntax
-        run: bash -n install.sh status.sh tests/test_functions.sh
+        run: bash -n install.sh recover.sh status.sh tests/test_functions.sh
 
       - name: Shellcheck
-        run: shellcheck -x -P SCRIPTDIR install.sh status.sh tests/test_functions.sh
+        run: shellcheck -x -P SCRIPTDIR install.sh recover.sh status.sh tests/test_functions.sh
 
       - name: Installer function tests
         run: bash tests/test_functions.sh
@@ -42,7 +42,7 @@ jobs:
           )
           for image in "${images[@]}"; do
             docker run --rm --volume "$PWD:/repo:ro" --workdir /repo "$image" \
-              bash -ec 'apt-get update -qq && apt-get install -y -qq python3 >/dev/null && bash -n install.sh status.sh tests/test_functions.sh && bash tests/test_functions.sh && python3 tests/test_static.py'
+              bash -ec 'apt-get update -qq && apt-get install -y -qq python3 >/dev/null && bash -n install.sh recover.sh status.sh tests/test_functions.sh && bash tests/test_functions.sh && python3 tests/test_static.py'
           done
 
       - name: Install pinned Gitleaks

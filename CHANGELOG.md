@@ -1,5 +1,14 @@
 # Changelog
 
+## Simple installer 1.0.0 — 2026-08-28
+
+- Add `install-simple.sh` for short-lived VPS nodes.
+- Install Docker, write the Remnawave Node files, and start the pinned Node
+  image without reading, modifying, verifying, or restoring host firewall
+  rules.
+- Default to the main Panel `89.110.92.101`, Node API `2222/tcp`, and
+  Hysteria2 `10443/udp`; allow overriding all three through explicit options.
+
 ## 1.0.9 — 2026-08-28
 
 - Recognize Docker's exact empty IPv6 `filter`/`nat` scaffold separately from

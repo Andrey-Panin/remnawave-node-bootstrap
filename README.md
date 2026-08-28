@@ -1,5 +1,30 @@
 # Remnawave Node Bootstrap
 
+## Быстрая установка без управления firewall
+
+Для временных VPS можно использовать отдельный простой установщик. Он не
+читает, не проверяет, не создаёт и не восстанавливает правила UFW/nftables/
+iptables. Старые transaction/recovery-маркеры полного установщика он также не
+использует.
+
+Одна команда с параметрами главной Panel (`89.110.92.101`, Node `2222/tcp`,
+Hysteria2 `10443/udp`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Andrey-Panin/remnawave-node-bootstrap/simple-v1.0.0/install-simple.sh -o /tmp/install-remnawave-simple.sh && sudo bash /tmp/install-remnawave-simple.sh
+```
+
+Скрипт запросит только `SECRET_KEY` из новой карточки Node. Если адрес Panel или
+порты отличаются, их можно передать явно:
+
+```bash
+sudo bash /tmp/install-remnawave-simple.sh --panel-ip 89.110.92.101 --node-port 2222 --hy2-port 10443
+```
+
+Docker может создать собственные стандартные служебные цепочки, но сам скрипт
+не вызывает `ufw`, `nft`, `iptables` или `ip6tables`. Доступность портов у
+провайдера VPS остаётся на стороне провайдера.
+
 Безопасный повторяемый установщик Remnawave Node на чистый VPS. Он разворачивает
 закреплённую версию Node, подключает её к существующей Panel по `SECRET_KEY` и
 готовит firewall для Hysteria2. Репозиторий не содержит инфраструктурных

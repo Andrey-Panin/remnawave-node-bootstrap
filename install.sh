@@ -14,8 +14,9 @@ unset PYTHONHOME PYTHONPATH CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
 unset GNUPGHOME APT_CONFIG GIT_CONFIG_COUNT
 unset SECRET_KEY
 
-readonly INSTALLER_VERSION='1.0.7'
+readonly INSTALLER_VERSION='1.0.8'
 readonly CONFIG_SCHEMA_VERSION='1'
+readonly FIREWALL_HASH_SCHEMA_VERSION='2'
 readonly MANAGED_BY='remnawave-node-bootstrap'
 readonly INSTALL_DIR='/opt/remnanode'
 readonly COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
@@ -29,6 +30,7 @@ readonly DOCKER_GPG_FINGERPRINT='9DC858229FC7DD38854AE2D88D81803C0EBFCD88'
 readonly ROLLBACK_FAILURE_EXIT=70
 readonly NODE_NFT_IPV4_TABLE='remnanode'
 readonly NODE_NFT_IPV6_TABLE='remnanode6'
+readonly RECOVERED_FIREWALL_BASELINE_NAME='recovered-firewall-baseline-v2'
 
 PANEL_IP=''
 NODE_PORT='2222'
@@ -45,6 +47,8 @@ PREVIOUS_PANEL_IP=''
 PREVIOUS_NODE_PORT=''
 PREVIOUS_HY2_PORT=''
 PREVIOUS_FIREWALL_MODE=''
+PREVIOUS_INSTALLER_VERSION=''
+PREVIOUS_FIREWALL_HASH_SCHEMA=''
 PREVIOUS_UFW_POLICY_HASH=''
 PREVIOUS_EFFECTIVE_FIREWALL_HASH=''
 PREVIOUS_CONTAINER_PRESENT=0
@@ -280,6 +284,9 @@ preflight_installation_identity() {
     PREVIOUS_NODE_PORT="$(read_setting NODE_PORT "$BOOTSTRAP_CONFIG")"
     PREVIOUS_HY2_PORT="$(read_setting HY2_PORT "$BOOTSTRAP_CONFIG")"
     PREVIOUS_FIREWALL_MODE="$(read_setting FIREWALL_MODE "$BOOTSTRAP_CONFIG")"
+    PREVIOUS_INSTALLER_VERSION="$(read_setting INSTALLER_VERSION "$BOOTSTRAP_CONFIG")"
+    PREVIOUS_FIREWALL_HASH_SCHEMA="$(read_setting FIREWALL_HASH_SCHEMA "$BOOTSTRAP_CONFIG")"
+    [[ -n "$PREVIOUS_FIREWALL_HASH_SCHEMA" ]] || PREVIOUS_FIREWALL_HASH_SCHEMA='1'
     PREVIOUS_UFW_POLICY_HASH="$(read_setting UFW_POLICY_HASH "$BOOTSTRAP_CONFIG")"
     PREVIOUS_EFFECTIVE_FIREWALL_HASH="$(read_setting EFFECTIVE_FIREWALL_HASH "$BOOTSTRAP_CONFIG")"
     validate_ipv4 "$PREVIOUS_PANEL_IP" || die 'Stored Panel IPv4 is invalid'
@@ -288,6 +295,8 @@ preflight_installation_identity() {
     [[ "$PREVIOUS_FIREWALL_MODE" == 'ufw' || "$PREVIOUS_FIREWALL_MODE" == 'external' ]] || \
         die 'Stored firewall mode is invalid'
     if [[ "$PREVIOUS_FIREWALL_MODE" == 'ufw' ]]; then
+        [[ "$PREVIOUS_FIREWALL_HASH_SCHEMA" == '1' || "$PREVIOUS_FIREWALL_HASH_SCHEMA" == '2' ]] || \
+            die 'Managed config has an unsupported firewall-hash schema'
         [[ "$PREVIOUS_EFFECTIVE_FIREWALL_HASH" =~ ^[a-f0-9]{64}$ ]] || \
             die 'Managed config has no valid effective-firewall hash'
     else
@@ -720,11 +729,33 @@ for line in sys.stdin:
 '
 }
 
-filter_managed_node_nft_tables() {
-    # Remnawave Node 3.3.2 creates these two native nftables tables whenever
-    # it has CAP_NET_ADMIN and deletes them during graceful shutdown. Their
-    # sets and counters are application runtime state, not the host ACL owned
-    # by this bootstrap. Exclude only the exact upstream-owned table names.
+normalize_v105_builtin_policies() {
+    # v1.0.5 did not preserve restore images. UFW may have changed the filter
+    # INPUT policy to DROP after the protected preflight snapshot. Reconstruct
+    # only the known clean-host INPUT/OUTPUT policies; retain Docker FORWARD as
+    # ACCEPT or DROP and let the strict recovery allow-list validate everything.
+    python3 -I -c '
+import re
+import sys
+
+table = None
+chain = re.compile(r"^:(\S+)\s+(\S+)(\s+\[[0-9]+:[0-9]+\])$")
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    if line.startswith("*"):
+        table = line[1:]
+    elif line == "COMMIT":
+        table = None
+    match = chain.fullmatch(line)
+    if match and table == "filter" and match.group(1) in {"INPUT", "OUTPUT"}:
+        line = f":{match.group(1)} ACCEPT{match.group(3)}"
+    sys.stdout.write(line + "\n")
+'
+}
+
+filter_managed_node_nft_tables_legacy() {
+    # Byte-compatible v1.0.6/v1.0.7 schema-1 filter. Do not normalize comments,
+    # whitespace, table order, or anything except the two exact Node tables.
     python3 -I -c '
 import re
 import sys
@@ -748,6 +779,278 @@ for line in sys.stdin:
 if depth:
     raise SystemExit(2)
 ' "$NODE_NFT_IPV4_TABLE" "$NODE_NFT_IPV6_TABLE"
+}
+
+filter_host_policy_nft_tables() {
+    local exclude_ipv4_compat="$1"
+    local exclude_ipv6_compat="$2"
+    [[ "$exclude_ipv4_compat" =~ ^[01]$ ]] || return 2
+    [[ "$exclude_ipv6_compat" =~ ^[01]$ ]] || return 2
+
+    # iptables-nft exposes the same policy twice: canonically through
+    # iptables-save and again as an implementation-detail nft ruleset. An
+    # iptables-restore round trip may reorder those nft tables and materialize
+    # empty ACCEPT built-in chains without changing policy. Canonicalize only
+    # those exact compatibility tables when the corresponding frontend is
+    # nf_tables, while retaining native-only objects/rules inside them.
+    # Remnawave's two exact application-owned tables are runtime state and are
+    # excluded independently.
+    python3 -I -c '
+import re
+import sys
+
+ipv4_name, ipv6_name, exclude_v4, exclude_v6 = sys.argv[1:5]
+targets = {("ip", ipv4_name), ("ip6", ipv6_name)}
+compat_names = {"filter", "nat", "mangle", "raw", "security"}
+table = re.compile(r"^\s*table\s+(\S+)\s+(\S+)\s*\{\s*$")
+
+def brace_delta(line):
+    depth = 0
+    quoted = False
+    escaped = False
+    for char in line:
+        if escaped:
+            escaped = False
+            continue
+        if quoted and char == "\\":
+            escaped = True
+            continue
+        if char == "\"":
+            quoted = not quoted
+            continue
+        if not quoted and char == "#":
+            break
+        if not quoted and char == "{":
+            depth += 1
+        elif not quoted and char == "}":
+            depth -= 1
+    return depth
+
+builtin_hooks = {
+    "filter": {
+        "INPUT": ("filter", "input", {"filter", "0"}),
+        "FORWARD": ("filter", "forward", {"filter", "0"}),
+        "OUTPUT": ("filter", "output", {"filter", "0"}),
+    },
+    "nat": {
+        "PREROUTING": ("nat", "prerouting", {"dstnat", "-100"}),
+        "INPUT": ("nat", "input", {"srcnat", "100"}),
+        "OUTPUT": ("nat", "output", {"dstnat", "-100"}),
+        "POSTROUTING": ("nat", "postrouting", {"srcnat", "100"}),
+    },
+    "mangle": {
+        "PREROUTING": ("filter", "prerouting", {"mangle", "-150"}),
+        "INPUT": ("filter", "input", {"mangle", "-150"}),
+        "FORWARD": ("filter", "forward", {"mangle", "-150"}),
+        "OUTPUT": ("route", "output", {"mangle", "-150"}),
+        "POSTROUTING": ("filter", "postrouting", {"mangle", "-150"}),
+    },
+    "raw": {
+        "PREROUTING": ("filter", "prerouting", {"raw", "-300"}),
+        "OUTPUT": ("filter", "output", {"raw", "-300"}),
+    },
+    "security": {
+        "INPUT": ("filter", "input", {"security", "50"}),
+        "FORWARD": ("filter", "forward", {"security", "50"}),
+        "OUTPUT": ("filter", "output", {"security", "50"}),
+    },
+}
+chain_header = re.compile(r"^\s*chain\s+(\S+)\s*\{\s*$")
+empty_base = re.compile(
+    r"^type\s+(filter|nat|route)\s+hook\s+(\S+)\s+priority\s+([^;]+);\s*"
+    r"policy\s+accept;\s*$"
+)
+base_decl = re.compile(
+    r"^type\s+(filter|nat|route)\s+hook\s+(\S+)\s+priority\s+([^;]+);"
+)
+priority_numbers = {
+    "raw": "-300", "mangle": "-150", "dstnat": "-100",
+    "filter": "0", "security": "50", "srcnat": "100",
+}
+
+def split_children(block):
+    children = []
+    index = 1
+    while index < len(block) - 1:
+        if not block[index].strip():
+            index += 1
+            continue
+        start = index
+        depth = brace_delta(block[index])
+        if depth < 0:
+            raise SystemExit(2)
+        index += 1
+        while depth > 0 and index < len(block) - 1:
+            depth += brace_delta(block[index])
+            if depth < 0:
+                raise SystemExit(2)
+            index += 1
+        if depth:
+            raise SystemExit(2)
+        children.append(block[start:index])
+    return children
+
+def chain_base_info(block):
+    match = chain_header.fullmatch(block[0].rstrip("\n"))
+    if not match:
+        return None
+    body = " ".join(line.strip() for line in block[1:-1] if line.strip())
+    base = base_decl.match(body)
+    if not base:
+        return None
+    priority = priority_numbers.get(base.group(3), base.group(3))
+    return match.group(1), base.group(1), base.group(2), priority
+
+def family_domains(family):
+    if family == "inet":
+        return {"ip", "ip6"}
+    return {family}
+
+def base_chain_keys(block, family):
+    result = set()
+    for child in split_children(block):
+        base = chain_base_info(child)
+        if base:
+            _, _, hook, priority = base
+            result.update((domain, hook, priority) for domain in family_domains(family))
+    return result
+
+def is_ignorable_empty_builtin(block, table_name):
+    match = chain_header.fullmatch(block[0].rstrip("\n"))
+    if not match or len(block) < 3 or block[-1].strip() != "}":
+        return False
+    expected = builtin_hooks.get(table_name, {}).get(match.group(1))
+    if expected is None:
+        return False
+    body = " ".join(line.strip() for line in block[1:-1] if line.strip())
+    base = empty_base.fullmatch(body)
+    return bool(
+        base
+        and base.group(1) == expected[0]
+        and base.group(2) == expected[1]
+        and base.group(3) in expected[2]
+    )
+
+def canonicalize_compat_table(block, table_name):
+    children = []
+    for child in split_children(block):
+        base = chain_base_info(child)
+        if base:
+            chain_name, chain_type, hook, priority = base
+            expected = builtin_hooks.get(table_name, {}).get(chain_name)
+            expected_priorities = {
+                priority_numbers.get(value, value) for value in expected[2]
+            } if expected else set()
+            if not expected or chain_type != expected[0] or hook != expected[1] or \
+                    priority not in expected_priorities:
+                raise SystemExit(2)
+        if not is_ignorable_empty_builtin(child, table_name):
+            children.append(child)
+    children.sort(key=lambda child: "".join(child))
+    result = [block[0]]
+    for child in children:
+        result.extend(child)
+    result.append(block[-1])
+    return result
+
+lines = list(sys.stdin)
+ordinary = []
+compat = []
+outside = []
+ordinary_base_keys = set()
+compat_base_keys = set()
+index = 0
+while index < len(lines):
+    match = table.fullmatch(lines[index].rstrip("\n"))
+    if not match:
+        if lines[index].strip() and not lines[index].lstrip().startswith("#"):
+            outside.append(lines[index])
+        index += 1
+        continue
+    start = index
+    depth = brace_delta(lines[index])
+    index += 1
+    while depth > 0 and index < len(lines):
+        depth += brace_delta(lines[index])
+        if depth < 0:
+            raise SystemExit(2)
+        index += 1
+    if depth:
+        raise SystemExit(2)
+    block = lines[start:index]
+    family, name = match.groups()
+    if (family, name) in targets:
+        continue
+    is_compat = name in compat_names and (
+        (family == "ip" and exclude_v4 == "1")
+        or (family == "ip6" and exclude_v6 == "1")
+    )
+    if is_compat:
+        compat_base_keys.update(base_chain_keys(block, family))
+        compat.append(((family, name), canonicalize_compat_table(block, name)))
+    else:
+        ordinary_base_keys.update(base_chain_keys(block, family))
+        ordinary.append(block)
+
+if ordinary_base_keys & compat_base_keys:
+    raise SystemExit(2)
+
+for line in outside:
+    sys.stdout.write(line)
+for block in ordinary:
+    sys.stdout.writelines(block)
+for _, block in sorted(compat, key=lambda item: item[0]):
+    sys.stdout.writelines(block)
+' "$NODE_NFT_IPV4_TABLE" "$NODE_NFT_IPV6_TABLE" "$exclude_ipv4_compat" "$exclude_ipv6_compat"
+}
+
+iptables_frontend_uses_nf_tables() {
+    local command_name="$1" output
+    command -v "$command_name" >/dev/null 2>&1 || return 1
+    output="$("$command_name" --version 2>/dev/null)" || return 1
+    [[ "$output" == *'(nf_tables)'* ]]
+}
+
+native_nft_policy_snapshot() {
+    local output exclude_ipv4_compat=0 exclude_ipv6_compat=0
+    if ! command -v nft >/dev/null 2>&1; then
+        printf 'missing\n'
+        return 0
+    fi
+    iptables_frontend_uses_nf_tables iptables && exclude_ipv4_compat=1
+    iptables_frontend_uses_nf_tables ip6tables && exclude_ipv6_compat=1
+    output="$(nft --stateless list ruleset 2>/dev/null)" || return 1
+    filter_host_policy_nft_tables "$exclude_ipv4_compat" "$exclude_ipv6_compat" <<<"$output"
+}
+
+compute_native_nft_policy_hash() {
+    local snapshot
+    snapshot="$(native_nft_policy_snapshot)" || return 1
+    if [[ -n "$snapshot" ]]; then
+        printf '%s\n' "$snapshot"
+    fi | sha256sum | awk '{print $1}'
+}
+
+native_nft_policy_hash_from_raw_evidence() {
+    local evidence_file="$1" output exclude_ipv4_compat=0 exclude_ipv6_compat=0
+    [[ -f "$evidence_file" && ! -L "$evidence_file" ]] || return 1
+    output="$(python3 -I -c '
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+marker = "### nft stateless ruleset\n"
+text = path.read_text(encoding="utf-8")
+if text.count(marker) != 1:
+    raise SystemExit(2)
+sys.stdout.write(text.split(marker, 1)[1])
+' "$evidence_file")" || return 1
+    iptables_frontend_uses_nf_tables iptables && exclude_ipv4_compat=1
+    iptables_frontend_uses_nf_tables ip6tables && exclude_ipv6_compat=1
+    output="$(filter_host_policy_nft_tables "$exclude_ipv4_compat" "$exclude_ipv6_compat" <<<"$output")" || return 1
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output"
+    fi | sha256sum | awk '{print $1}'
 }
 
 iptables_firewall_snapshot() {
@@ -779,19 +1082,51 @@ raw_effective_firewall_snapshot() {
 }
 
 effective_firewall_snapshot() {
+    iptables_firewall_snapshot || return 1
+    printf '### native nft stateless ruleset\n'
+    native_nft_policy_snapshot || return 1
+}
+
+compute_effective_firewall_hash() {
+    effective_firewall_snapshot | sha256sum | awk '{print $1}'
+}
+
+legacy_effective_firewall_snapshot() {
     local output
     iptables_firewall_snapshot || return 1
     printf '### nft stateless ruleset\n'
     if command -v nft >/dev/null 2>&1; then
         output="$(nft --stateless list ruleset 2>/dev/null)" || return 1
-        filter_managed_node_nft_tables <<<"$output" || return 1
+        filter_managed_node_nft_tables_legacy <<<"$output" || return 1
     else
         printf 'missing\n'
     fi
 }
 
-compute_effective_firewall_hash() {
-    effective_firewall_snapshot | sha256sum | awk '{print $1}'
+compute_legacy_effective_firewall_hash() {
+    legacy_effective_firewall_snapshot | sha256sum | awk '{print $1}'
+}
+
+normalized_iptables_restore_hash() {
+    local restore_file="$1"
+    [[ -f "$restore_file" && ! -L "$restore_file" ]] || return 1
+    normalize_iptables_save <"$restore_file" | sha256sum | awk '{print $1}'
+}
+
+live_iptables_policy_hash() {
+    local save_command="$1" output
+    command -v "$save_command" >/dev/null 2>&1 || return 1
+    output="$("$save_command")" || return 1
+    normalize_iptables_save <<<"$output" | sha256sum | awk '{print $1}'
+}
+
+iptables_restore_image_matches_live() {
+    local restore_file="$1"
+    local save_command="$2"
+    local expected actual
+    expected="$(normalized_iptables_restore_hash "$restore_file")" || return 1
+    actual="$(live_iptables_policy_hash "$save_command")" || return 1
+    [[ "$actual" == "$expected" ]]
 }
 
 write_firewall_evidence() {
@@ -1131,7 +1466,7 @@ snapshot_runtime_baseline() {
 }
 
 runtime_snapshot_is_current() {
-    local present=0 running=0 image='' marker=''
+    local present=0 running=0 image='' marker='' inventory_hash
     if docker inspect remnanode >/dev/null 2>&1; then
         present=1
         image="$(docker inspect --format '{{.Config.Image}}' remnanode)"
@@ -1142,7 +1477,8 @@ runtime_snapshot_is_current() {
     fi
     (( present == SNAPSHOT_CONTAINER_PRESENT && running == SNAPSHOT_CONTAINER_RUNNING )) || return 1
     [[ "$image" == "$SNAPSHOT_CONTAINER_IMAGE" && "$marker" == "$SNAPSHOT_CONTAINER_MARKER" ]] || return 1
-    [[ "$(compute_docker_inventory_hash)" == "$SNAPSHOT_DOCKER_INVENTORY_HASH" ]] || return 1
+    inventory_hash="$(compute_docker_inventory_hash)" || return 1
+    [[ "$inventory_hash" == "$SNAPSHOT_DOCKER_INVENTORY_HASH" ]] || return 1
     if (( HAD_MANAGED_INSTALL == 1 )); then
         listener_state_matches "$PREVIOUS_TCP_LISTENER_STATE" tcp "$PREVIOUS_NODE_PORT" || return 1
         listener_state_matches "$PREVIOUS_HY2_LISTENER_STATE" udp "$PREVIOUS_HY2_PORT" || return 1
@@ -1150,13 +1486,18 @@ runtime_snapshot_is_current() {
 }
 
 verify_pre_apply_drift() {
+    local current_ufw_hash current_effective_hash
     verify_backup_integrity || die 'Backup integrity verification failed before apply'
     verify_live_managed_snapshot || die 'Managed files changed after their backup; refusing apply'
     runtime_snapshot_is_current || die 'Container or listener state changed after its snapshot; refusing apply'
     verify_live_ufw_snapshot || die 'Firewall policy files changed after their backup; refusing apply'
-    [[ "$(compute_ufw_policy_hash)" == "$SNAPSHOT_UFW_POLICY_HASH" ]] || \
+    current_ufw_hash="$(compute_ufw_policy_hash)" || \
+        die 'Unable to inspect firewall policy files before apply'
+    [[ "$current_ufw_hash" == "$SNAPSHOT_UFW_POLICY_HASH" ]] || \
         die 'Firewall policy files changed after their snapshot; refusing apply'
-    [[ "$(compute_effective_firewall_hash)" == "$SNAPSHOT_EFFECTIVE_FIREWALL_HASH" ]] || \
+    current_effective_hash="$(compute_effective_firewall_hash)" || \
+        die 'Unable to inspect effective firewall rules before apply'
+    [[ "$current_effective_hash" == "$SNAPSHOT_EFFECTIVE_FIREWALL_HASH" ]] || \
         die 'Effective firewall rules changed after their snapshot; refusing apply'
     local active_now=0
     if command -v ufw >/dev/null 2>&1 && \
@@ -1412,10 +1753,16 @@ matches_recovered_fresh_firewall_baseline() {
     [[ -d "$BACKUP_ROOT" && ! -L "$BACKUP_ROOT" && \
         "$(stat -c '%u:%g:%a' -- "$BACKUP_ROOT")" == '0:0:700' ]] || return 1
 
-    local current_effective current_ufw marker state transaction metadata manifest
-    local source_version had_install previous_present previous_active expected_effective expected_ufw
+    local current_effective current_ufw current_v4 current_v6 current_native
+    local marker state transaction metadata manifest baseline
+    local source_version had_install previous_present previous_active expected_ufw
+    local baseline_schema baseline_writer baseline_source baseline_effective baseline_ufw
+    local baseline_v4 baseline_v6 baseline_native
     current_effective="$(compute_effective_firewall_hash)" || return 1
     current_ufw="$(compute_ufw_policy_hash)" || return 1
+    current_v4="$(live_iptables_policy_hash iptables-save)" || return 1
+    current_v6="$(live_iptables_policy_hash ip6tables-save)" || return 1
+    current_native="$(compute_native_nft_policy_hash)" || return 1
     while IFS= read -r -d '' marker; do
         [[ -f "$marker" && ! -L "$marker" && \
             "$(stat -c '%u:%g:%a' -- "$marker")" == '0:0:600' ]] || continue
@@ -1427,21 +1774,38 @@ matches_recovered_fresh_firewall_baseline() {
             "$(stat -c '%u:%g:%a' -- "$transaction")" == '0:0:700' ]] || continue
         metadata="${transaction}/metadata"
         manifest="${transaction}/managed-files.manifest"
+        baseline="${transaction}/${RECOVERED_FIREWALL_BASELINE_NAME}"
         [[ -f "$metadata" && ! -L "$metadata" && \
-            "$(stat -c '%u:%g:%a' -- "$metadata")" == '0:0:600' && \
-            -f "$manifest" && ! -L "$manifest" && \
-            "$(stat -c '%u:%g:%a' -- "$manifest")" == '0:0:600' ]] || continue
+             "$(stat -c '%u:%g:%a' -- "$metadata")" == '0:0:600' && \
+             -f "$manifest" && ! -L "$manifest" && \
+             "$(stat -c '%u:%g:%a' -- "$manifest")" == '0:0:600' && \
+             -f "$baseline" && ! -L "$baseline" && \
+             "$(stat -c '%u:%g:%a' -- "$baseline")" == '0:0:600' ]] || continue
 
         source_version="$(read_setting installer_version "$metadata")"
         had_install="$(read_setting had_managed_install "$metadata")"
         previous_present="$(read_setting previous_container_present "$metadata")"
         previous_active="$(read_setting ufw_previous_active "$metadata")"
-        expected_effective="$(read_setting effective_firewall_hash "$metadata")"
         expected_ufw="$(read_setting ufw_policy_hash "$metadata")"
-        [[ "$source_version" == '1.0.5' || "$source_version" == '1.0.6' || "$source_version" == '1.0.7' ]] || continue
+        baseline_schema="$(read_setting schema "$baseline")"
+        baseline_writer="$(read_setting recovery_writer_version "$baseline")"
+        baseline_source="$(read_setting source_transaction_version "$baseline")"
+        baseline_effective="$(read_setting effective_firewall_hash "$baseline")"
+        baseline_ufw="$(read_setting ufw_policy_hash "$baseline")"
+        baseline_v4="$(read_setting ipv4_policy_hash "$baseline")"
+        baseline_v6="$(read_setting ipv6_policy_hash "$baseline")"
+        baseline_native="$(read_setting native_nft_policy_hash "$baseline")"
+        [[ "$source_version" == '1.0.5' || "$source_version" == '1.0.6' || \
+            "$source_version" == '1.0.7' || "$source_version" == '1.0.8' ]] || continue
         [[ "$had_install" == '0' && "$previous_present" == '0' && "$previous_active" == '0' ]] || continue
-        [[ "$expected_effective" =~ ^[a-f0-9]{64}$ && "$expected_effective" == "$current_effective" ]] || continue
-        [[ "$expected_ufw" =~ ^[a-f0-9]{64}$ && "$expected_ufw" == "$current_ufw" ]] || continue
+        [[ "$baseline_schema" == '2' && "$baseline_writer" == '1.0.8' && \
+            "$baseline_source" == "$source_version" ]] || continue
+        [[ "$baseline_effective" =~ ^[a-f0-9]{64}$ && "$baseline_effective" == "$current_effective" ]] || continue
+        [[ "$expected_ufw" =~ ^[a-f0-9]{64}$ && "$baseline_ufw" == "$expected_ufw" && \
+            "$baseline_ufw" == "$current_ufw" ]] || continue
+        [[ "$baseline_v4" =~ ^[a-f0-9]{64}$ && "$baseline_v4" == "$current_v4" ]] || continue
+        [[ "$baseline_v6" =~ ^[a-f0-9]{64}$ && "$baseline_v6" == "$current_v6" ]] || continue
+        [[ "$baseline_native" =~ ^[a-f0-9]{64}$ && "$baseline_native" == "$current_native" ]] || continue
         [[ "$(wc -l <"$manifest")" -eq 3 ]] || continue
 
         local destination record presence
@@ -1482,11 +1846,23 @@ preflight_firewall() {
         [[ "$PREVIOUS_FIREWALL_MODE" == 'ufw' ]] || die 'Firewall mode drift detected'
         head -n 1 <<<"$status" | grep -q '^Status: active$' || die 'Managed UFW is no longer active'
         [[ -n "$PREVIOUS_UFW_POLICY_HASH" ]] || die 'Managed config has no UFW policy hash'
-        current_hash="$(compute_ufw_policy_hash)"
+        current_hash="$(compute_ufw_policy_hash)" || \
+            die 'Unable to inspect the managed UFW policy'
         [[ "$current_hash" == "$PREVIOUS_UFW_POLICY_HASH" ]] || \
             die 'UFW policy changed outside this installer; use --external-firewall after manual reconciliation'
-        current_effective_hash="$(compute_effective_firewall_hash)" || \
-            die 'Unable to inspect the managed effective firewall ruleset'
+        case "$PREVIOUS_FIREWALL_HASH_SCHEMA" in
+            1)
+                [[ "$PREVIOUS_INSTALLER_VERSION" == '1.0.6' || "$PREVIOUS_INSTALLER_VERSION" == '1.0.7' ]] || \
+                    die 'Legacy managed firewall hash cannot be migrated automatically'
+                current_effective_hash="$(compute_legacy_effective_firewall_hash)" || \
+                    die 'Unable to inspect the legacy managed effective firewall ruleset'
+                ;;
+            2)
+                current_effective_hash="$(compute_effective_firewall_hash)" || \
+                    die 'Unable to inspect the managed effective firewall ruleset'
+                ;;
+            *) die 'Managed config has an unsupported firewall-hash schema' ;;
+        esac
         [[ "$current_effective_hash" == "$PREVIOUS_EFFECTIVE_FIREWALL_HASH" ]] || \
             die 'Effective firewall rules changed outside this installer; use --external-firewall after manual reconciliation'
     else
@@ -1509,6 +1885,7 @@ write_bootstrap_config_to() {
         printf 'MANAGED_BY=%s\n' "$MANAGED_BY"
         printf 'CONFIG_SCHEMA_VERSION=%s\n' "$CONFIG_SCHEMA_VERSION"
         printf 'INSTALLER_VERSION=%s\n' "$INSTALLER_VERSION"
+        printf 'FIREWALL_HASH_SCHEMA=%s\n' "$FIREWALL_HASH_SCHEMA_VERSION"
         printf 'NODE_IMAGE=%s\n' "$NODE_IMAGE"
         printf 'PANEL_IP=%s\n' "$PANEL_IP"
         printf 'NODE_PORT=%s\n' "$NODE_PORT"
@@ -1710,7 +2087,8 @@ configure_firewall() {
         ufw --force enable >/dev/null
     fi
     verify_ufw_policy
-    CURRENT_UFW_POLICY_HASH="$(compute_ufw_policy_hash)"
+    CURRENT_UFW_POLICY_HASH="$(compute_ufw_policy_hash)" || \
+        die 'Unable to hash the configured UFW policy'
     write_firewall_evidence after-ufw || die 'Unable to record firewall evidence after UFW configuration'
     CURRENT_EFFECTIVE_FIREWALL_HASH="$(sha256sum -- "${BACKUP_DIR}/firewall-host-after-ufw.txt" | awk '{print $1}')"
 }
@@ -1792,10 +2170,15 @@ restore_firewall_snapshot() {
     if (( active_now != UFW_PREVIOUS_ACTIVE )); then
         record_rollback_error 'UFW active/inactive state differs from backup'
     fi
-    if [[ "$(compute_ufw_policy_hash)" != "$SNAPSHOT_UFW_POLICY_HASH" ]]; then
+    local restored_ufw_hash restored_effective_hash
+    if ! restored_ufw_hash="$(compute_ufw_policy_hash)"; then
+        record_rollback_error 'restored UFW policy files could not be inspected'
+    elif [[ "$restored_ufw_hash" != "$SNAPSHOT_UFW_POLICY_HASH" ]]; then
         record_rollback_error 'restored UFW policy files differ from backup'
     fi
-    if [[ "$(compute_effective_firewall_hash 2>/dev/null || true)" != "$SNAPSHOT_EFFECTIVE_FIREWALL_HASH" ]]; then
+    if ! restored_effective_hash="$(compute_effective_firewall_hash 2>/dev/null)"; then
+        record_rollback_error 'restored effective firewall rules could not be inspected'
+    elif [[ "$restored_effective_hash" != "$SNAPSHOT_EFFECTIVE_FIREWALL_HASH" ]]; then
         record_rollback_error 'restored effective firewall rules differ from backup'
     fi
 }
@@ -1995,8 +2378,11 @@ main() {
     configure_firewall
     start_and_verify_node
     if [[ "$FIREWALL_MODE" == 'ufw' ]]; then
+        local final_ufw_hash
         verify_ufw_policy
-        [[ "$(compute_ufw_policy_hash)" == "$CURRENT_UFW_POLICY_HASH" ]] || \
+        final_ufw_hash="$(compute_ufw_policy_hash)" || \
+            die 'Unable to inspect managed UFW files before completion'
+        [[ "$final_ufw_hash" == "$CURRENT_UFW_POLICY_HASH" ]] || \
             die 'Managed UFW files drifted before completion'
         write_firewall_evidence after-node || die 'Unable to record firewall evidence after Node startup'
         [[ "$(sha256sum -- "${BACKUP_DIR}/firewall-host-after-node.txt" | awk '{print $1}')" == \

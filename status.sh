@@ -28,12 +28,17 @@ FIREWALL_MODE="$(read_setting FIREWALL_MODE "$BOOTSTRAP_CONFIG")"
 EXPECTED_IMAGE="$(read_setting NODE_IMAGE "$BOOTSTRAP_CONFIG")"
 EXPECTED_UFW_HASH="$(read_setting UFW_POLICY_HASH "$BOOTSTRAP_CONFIG")"
 EXPECTED_EFFECTIVE_FIREWALL_HASH="$(read_setting EFFECTIVE_FIREWALL_HASH "$BOOTSTRAP_CONFIG")"
+EXPECTED_FIREWALL_HASH_SCHEMA="$(read_setting FIREWALL_HASH_SCHEMA "$BOOTSTRAP_CONFIG")"
+[[ -n "$EXPECTED_FIREWALL_HASH_SCHEMA" ]] || EXPECTED_FIREWALL_HASH_SCHEMA='1'
+CONFIG_INSTALLER_VERSION="$(read_setting INSTALLER_VERSION "$BOOTSTRAP_CONFIG")"
 
 validate_ipv4 "$PANEL_IP" || die 'Stored Panel IPv4 is invalid'
 validate_port "$NODE_PORT" || die 'Stored Node port is invalid'
 validate_port "$HY2_PORT" || die 'Stored Hysteria2 port is invalid'
 case "$FIREWALL_MODE" in
     ufw)
+        [[ "$EXPECTED_FIREWALL_HASH_SCHEMA" == '1' || "$EXPECTED_FIREWALL_HASH_SCHEMA" == '2' ]] || \
+            die 'Managed firewall-hash schema is unsupported'
         [[ "$EXPECTED_UFW_HASH" =~ ^[a-f0-9]{64}$ && "$EXPECTED_EFFECTIVE_FIREWALL_HASH" =~ ^[a-f0-9]{64}$ ]] || \
             die 'Managed firewall hashes are missing or invalid'
         ;;
@@ -94,9 +99,28 @@ case "$FIREWALL_MODE" in
             elif ! grep -q '^Default: deny (incoming), allow (outgoing)' <<<"$UFW_STATUS"; then
                 status_fail 'Managed UFW default policy drifted'
             else
-                CURRENT_HASH="$(compute_ufw_policy_hash)"
-                [[ "$CURRENT_HASH" == "$EXPECTED_UFW_HASH" ]] || status_fail 'Managed UFW policy hash drifted'
-                CURRENT_EFFECTIVE_HASH="$(compute_effective_firewall_hash 2>/dev/null || true)"
+                if ! CURRENT_HASH="$(compute_ufw_policy_hash 2>/dev/null)"; then
+                    CURRENT_HASH=''
+                    status_fail 'Managed UFW policy could not be inspected'
+                elif [[ "$CURRENT_HASH" != "$EXPECTED_UFW_HASH" ]]; then
+                    status_fail 'Managed UFW policy hash drifted'
+                fi
+                case "$EXPECTED_FIREWALL_HASH_SCHEMA" in
+                    1)
+                        if [[ "$CONFIG_INSTALLER_VERSION" == '1.0.6' || "$CONFIG_INSTALLER_VERSION" == '1.0.7' ]]; then
+                            if ! CURRENT_EFFECTIVE_HASH="$(compute_legacy_effective_firewall_hash 2>/dev/null)"; then
+                                CURRENT_EFFECTIVE_HASH=''
+                            fi
+                        else
+                            CURRENT_EFFECTIVE_HASH=''
+                        fi
+                        ;;
+                    2)
+                        if ! CURRENT_EFFECTIVE_HASH="$(compute_effective_firewall_hash 2>/dev/null)"; then
+                            CURRENT_EFFECTIVE_HASH=''
+                        fi
+                        ;;
+                esac
                 [[ -n "$CURRENT_EFFECTIVE_HASH" && "$CURRENT_EFFECTIVE_HASH" == "$EXPECTED_EFFECTIVE_FIREWALL_HASH" ]] || \
                     status_fail 'Effective firewall rules drifted or could not be inspected'
                 UNSAFE=''

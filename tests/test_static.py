@@ -159,7 +159,10 @@ def test_invariants() -> None:
         "primary_fingerprints",
         "docker compose",
         "trap on_exit EXIT",
-        "filter_managed_node_nft_tables",
+        "filter_host_policy_nft_tables",
+        "filter_managed_node_nft_tables_legacy",
+        "compute_native_nft_policy_hash",
+        "native_nft_policy_hash_from_raw_evidence",
         "matches_recovered_fresh_firewall_baseline",
         "firewall-restore-v4.txt",
         "write_firewall_evidence after-node",
@@ -196,6 +199,12 @@ def test_invariants() -> None:
         "sha256sum --check --status",
         "restore_recovery_attempt",
         "verify_recovered_source_state",
+        "write_recovered_firewall_baseline",
+        "iptables_restore_image_matches_live",
+        "assert_v105_docker_only_restore_image",
+        "normalize_v105_builtin_policies",
+        "compute_isolated_native_hash",
+        "assert_recovery_runtime_provable",
     ]
     for fragment in required_recovery_fragments:
         if fragment not in recovery:

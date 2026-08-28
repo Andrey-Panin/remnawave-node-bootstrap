@@ -21,7 +21,7 @@
 Запустите на новом Ubuntu VPS от пользователя с `sudo`:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git && git clone --branch v1.0.7 --depth 1 https://github.com/Andrey-Panin/remnawave-node-bootstrap.git
+sudo apt-get update && sudo apt-get install -y git && git clone --branch v1.0.8 --depth 1 https://github.com/Andrey-Panin/remnawave-node-bootstrap.git
 cd remnawave-node-bootstrap
 sudo bash install.sh
 ```
@@ -93,12 +93,14 @@ sudo bash install.sh --external-firewall
 по тем же правилам.
 
 После первой управляемой установки сохраняется hash всех значимых UFW policy
-files и системной части эффективного iptables/nftables ruleset. Две точные
-таблицы приложения — `ip remnanode` и `ip6 remnanode6` — создаются самой Node,
-меняются её плагинами и поэтому не входят в hash системного firewall. Все другие
-таблицы, цепочки, политики и правила продолжают контролироваться. Root-only
-backup также содержит исходные IPv4/IPv6 restore images и снимки ruleset до
-UFW, после UFW и после запуска Node.
+files и системной части эффективного iptables/nftables ruleset. Таблицы
+`iptables-nft` учитываются один раз через нормализованный `iptables-save`, а
+native nftables policy контролируется отдельно. Поэтому безопасный
+`iptables-restore` не создаёт ложный drift только из-за нового порядка таблиц
+или пустых встроенных цепочек. Две точные таблицы приложения — `ip remnanode` и
+`ip6 remnanode6` — создаются самой Node, меняются её плагинами и поэтому не
+входят в hash системного firewall. Root-only backup также содержит исходные
+IPv4/IPv6 restore images и снимки ruleset до UFW, после UFW и после запуска Node.
 
 ## Транзакция и откат
 
@@ -113,7 +115,7 @@ UFW, после UFW и после запуска Node.
 предыдущее состояние контейнера (отсутствовал/running/stopped). Ошибка самого
 отката возвращает отдельный exit code `70`, оставляет
 `ROLLBACK_INCOMPLETE` и блокирует повторный запуск до сверки. Для незавершённой
-первой установки v1.0.5–v1.0.7 без прежней ноды используется отдельный
+первой установки v1.0.5–v1.0.8 без прежней ноды используется отдельный
 fail-closed recovery:
 
 ```bash
@@ -121,9 +123,14 @@ sudo bash recover.sh
 ```
 
 Recovery проверяет root-only backup, показывает план и ждёт слово `RECOVER`.
-Перед изменением он сохраняет ещё один снимок текущих файлов и firewall. Если
-восстановленный ruleset не совпадёт с исходным hash, состояние до попытки
-recovery возвращается, а unresolved marker сохраняется.
+Перед изменением он сохраняет ещё один снимок текущих файлов и firewall.
+Восстановленные IPv4/IPv6 policy сравниваются с защищёнными нормализованными
+restore images, а native nftables policy — с независимым hash. При несовпадении
+состояние до попытки recovery возвращается, а unresolved marker сохраняется.
+Для старого backup v1.0.5, в котором ещё не сохранялись restore images,
+допускается только строго известный пустой Docker ruleset. Ожидаемое native-nft
+состояние строится из него в одноразовом изолированном network namespace, а не
+из текущих правил VPS.
 
 Установленные OS/Docker packages не удаляются при rollback. Сбой питания или
 `SIGKILL` может прервать процесс без обработчика; сохранённый `APPLYING` marker

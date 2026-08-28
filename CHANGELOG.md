@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.8 — 2026-08-28
+
+- Hash `iptables-nft` policy once through normalized `iptables-save`; retain
+  native nftables tables separately so harmless table reordering and empty
+  built-in chains created by `iptables-restore` no longer cause false drift.
+- Verify recovery against the protected normalized IPv4/IPv6 restore images
+  and an independently preserved native-nft policy hash instead of an
+  unreproducible legacy textual nftables hash.
+- For legacy v1.0.5 transactions, accept only a pristine/known empty-Docker
+  restore image and derive its expected native-nft hash in an isolated network
+  namespace; foreign containers, secondary legacy rules, and native drift
+  remain fail-closed.
+- Permit an interrupted install's one verified stopped `remnanode` container
+  during pre-recovery capture and prove the corresponding stopped/absent state
+  again if recovery itself must roll back.
+- Persist a root-only schema-v2 recovered baseline so a failed fresh install
+  from v1.0.5-v1.0.8 can be reconciled and safely retried.
+- Retain read-only verification compatibility for completed v1.0.6/v1.0.7
+  managed installations and migrate them to firewall-hash schema 2 on their
+  next successful reconfiguration.
+
 ## 1.0.7 — 2026-08-28
 
 - Allow a fresh retry to retain Docker's installed firewall scaffolding only

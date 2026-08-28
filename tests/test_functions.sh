@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
+# Test doubles are invoked indirectly by sourced helpers.
+# shellcheck disable=SC2317
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_PYTHON_BIN="$(command -v python3 || command -v python)"
-# shellcheck source=../install.sh
-source "${ROOT}/install.sh"
+# shellcheck source=../recover.sh
+source "${ROOT}/recover.sh"
 
 # install.sh intentionally replaces PATH for root safety. Keep the exact test
 # interpreter selected before sourcing so these tests also run under Git Bash.
@@ -61,13 +63,48 @@ normalized_policy_change="$(normalize_iptables_save <<<"$iptables_policy_change"
 [[ "$normalized_a" == "$normalized_b" ]]
 [[ "$normalized_a" != "$normalized_policy_change" ]]
 
-nft_with_managed_tables=$'table ip filter {\n\tchain INPUT {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\ntable ip remnanode {\n\tset ingress-filter-ip {\n\t\ttype ipv4_addr\n\t}\n}\ntable ip6 remnanode6 {\n\tchain output {\n\t\ttype filter hook output priority -10; policy accept;\n\t}\n}\ntable ip remnanode-shadow {\n\tchain input {\n\t}\n}'
-nft_without_managed_tables="$(filter_managed_node_nft_tables <<<"$nft_with_managed_tables")"
-[[ "$nft_without_managed_tables" == *'table ip filter {'* ]]
-[[ "$nft_without_managed_tables" == *'table ip remnanode-shadow {'* ]]
-[[ "$nft_without_managed_tables" != *'table ip remnanode {'* ]]
-[[ "$nft_without_managed_tables" != *'table ip6 remnanode6 {'* ]]
-expect_failure filter_managed_node_nft_tables <<<'table ip remnanode {'
+nft_before_restore=$'# Warning: table ip nat is managed by iptables-nft\ntable ip nat {\n\tchain DOCKER {\n\t}\n\tchain PREROUTING {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n\t}\n}\ntable inet operator-policy {\n\tchain input {\n\t\ttype filter hook input priority 10; policy accept;\n\t}\n}\n# Warning: table ip filter is managed by iptables-nft\ntable ip filter {\n\tchain INPUT {\n\t\ttype filter hook input priority filter; policy accept;\n\t}\n}\ntable ip remnanode {\n\tset ingress-filter-ip {\n\t\ttype ipv4_addr\n\t}\n}\ntable ip6 remnanode6 {\n\tchain output {\n\t\ttype filter hook output priority -10; policy accept;\n\t}\n}\ntable ip remnanode-shadow {\n\tchain input {\n\t}\n}'
+nft_after_restore=$'# Warning: table ip filter is managed by iptables-nft\ntable ip filter {\n\tchain INPUT {\n\t\ttype filter hook input priority filter; policy accept;\n\t}\n}\n# Warning: table ip nat is managed by iptables-nft\ntable ip nat {\n\tchain PREROUTING {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n\t}\n\tchain INPUT {\n\t\ttype nat hook input priority srcnat; policy accept;\n\t}\n\tchain POSTROUTING {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t}\n\tchain DOCKER {\n\t}\n}\ntable inet operator-policy {\n\tchain input {\n\t\ttype filter hook input priority 10; policy accept;\n\t}\n}\ntable ip remnanode-shadow {\n\tchain input {\n\t}\n}'
+nft_policy_before="$(filter_host_policy_nft_tables 1 1 <<<"$nft_before_restore")"
+nft_policy_after="$(filter_host_policy_nft_tables 1 1 <<<"$nft_after_restore")"
+[[ "$nft_policy_before" == "$nft_policy_after" ]]
+[[ "$nft_policy_before" == *'table inet operator-policy {'* ]]
+[[ "$nft_policy_before" == *'table ip remnanode-shadow {'* ]]
+[[ "$nft_policy_before" == *'table ip filter {'* ]]
+[[ "$nft_policy_before" == *'table ip nat {'* ]]
+[[ "$nft_policy_before" != *'table ip remnanode {'* ]]
+[[ "$nft_policy_before" != *'table ip6 remnanode6 {'* ]]
+[[ "$(filter_host_policy_nft_tables 0 0 <<<"$nft_before_restore")" == *'table ip filter {'* ]]
+expect_failure filter_host_policy_nft_tables 1 1 <<<'table ip remnanode {'
+nft_priority_collision="${nft_before_restore/priority 10/priority 0}"
+expect_failure filter_host_policy_nft_tables 1 1 <<<"$nft_priority_collision"
+legacy_filtered="$(filter_managed_node_nft_tables_legacy <<<"$nft_before_restore")"
+[[ "$legacy_filtered" == *'# Warning: table ip nat is managed by iptables-nft'* ]]
+[[ "$legacy_filtered" == *'table ip filter {'* ]]
+[[ "$legacy_filtered" != *'table ip remnanode {'* ]]
+expect_failure filter_managed_node_nft_tables_legacy <<<'table ip remnanode {'
+
+nft_native_policy_change="${nft_before_restore/type filter hook input priority 10; policy accept/type filter hook input priority 10; policy drop}"
+compat_native_rule=$'type filter hook input priority filter; policy accept;\n\t\tip saddr 198.51.100.20 drop;'
+nft_compat_native_change="${nft_before_restore/type filter hook input priority filter; policy accept;/$compat_native_rule}"
+
+iptables() { printf 'iptables v1.8.10 (nf_tables)\n'; }
+ip6tables() { printf 'ip6tables v1.8.10 (nf_tables)\n'; }
+iptables-save() { printf '%s\n' "$iptables_snapshot_a"; }
+ip6tables-save() { printf '%s\n' "$iptables_snapshot_a"; }
+nft() { printf '%s\n' "$nft_before_restore"; }
+effective_before_restore="$(compute_effective_firewall_hash)"
+nft() { printf '%s\n' "$nft_after_restore"; }
+effective_after_restore="$(compute_effective_firewall_hash)"
+[[ "$effective_before_restore" == "$effective_after_restore" ]]
+nft() { printf '%s\n' "$nft_native_policy_change"; }
+[[ "$(compute_effective_firewall_hash)" != "$effective_before_restore" ]]
+nft() { printf '%s\n' "$nft_compat_native_change"; }
+[[ "$(compute_effective_firewall_hash)" != "$effective_before_restore" ]]
+nft() { printf '%s\n' "$nft_after_restore"; }
+iptables-save() { printf '%s\n' "$iptables_policy_change"; }
+[[ "$(compute_effective_firewall_hash)" != "$effective_before_restore" ]]
+iptables-save() { printf '%s\n' "$iptables_snapshot_a"; }
 
 iptables_with_ufw=$'*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n:DOCKER-USER - [0:0]\n:ufw-before-input - [0:0]\n:ufw6-before-input - [0:0]\n-A INPUT -j ufw-before-input\n-A FORWARD -j DOCKER-USER\n-A ufw-before-input -s 1.2.3.4 -j ACCEPT\n-A ufw6-before-input -j ACCEPT\nCOMMIT'
 iptables_without_ufw="$(filter_inactive_ufw_iptables_save <<<"$iptables_with_ufw")"
@@ -77,10 +114,93 @@ iptables_without_ufw="$(filter_inactive_ufw_iptables_save <<<"$iptables_with_ufw
 [[ "$iptables_without_ufw" != *'ufw6-before-input'* ]]
 
 tmp="$(mktemp)"
-trap 'rm -f -- "$tmp"' EXIT
+tmp_restore="$(mktemp)"
+trap 'rm -f -- "$tmp" "$tmp_restore"' EXIT
+
+v105_pristine=$'*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\nCOMMIT'
+v105_docker=$'*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n:DOCKER - [0:0]\n:DOCKER-BRIDGE - [0:0]\n:DOCKER-CT - [0:0]\n:DOCKER-FORWARD - [0:0]\n:DOCKER-INTERNAL - [0:0]\n:DOCKER-USER - [0:0]\n-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n-A DOCKER ! -i docker0 -o docker0 -j DROP\n-A DOCKER-BRIDGE -o docker0 -j DOCKER\n-A DOCKER-CT -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n-A DOCKER-FORWARD -j DOCKER-CT\n-A DOCKER-FORWARD -j DOCKER-INTERNAL\n-A DOCKER-FORWARD -j DOCKER-BRIDGE\n-A DOCKER-FORWARD -i docker0 -j ACCEPT\nCOMMIT\n*nat\n:PREROUTING ACCEPT [0:0]\n:INPUT ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n:POSTROUTING ACCEPT [0:0]\n:DOCKER - [0:0]\n-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER\n-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER\n-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE\nCOMMIT'
+printf '%s\n' "$v105_pristine" >"$tmp_restore"
+expect_success assert_v105_docker_only_restore_image "$tmp_restore" 0
+printf '%s\n' "$v105_docker" >"$tmp_restore"
+expect_success assert_v105_docker_only_restore_image "$tmp_restore" 1
+expect_failure assert_v105_docker_only_restore_image "$tmp_restore" 0
+printf '%s\n' "${v105_docker/-A FORWARD -j DOCKER-USER$'\n'-A FORWARD -j DOCKER-FORWARD/-A FORWARD -j DOCKER-FORWARD$'\n'-A FORWARD -j DOCKER-USER}" >"$tmp_restore"
+expect_failure assert_v105_docker_only_restore_image "$tmp_restore" 1
+printf '%s\n' "${v105_docker/-A DOCKER ! -i docker0 -o docker0 -j DROP/-A DOCKER ! -i docker0 -o docker0 -j ACCEPT}" >"$tmp_restore"
+expect_failure assert_v105_docker_only_restore_image "$tmp_restore" 1
+printf '%s\n' "${v105_docker/:FORWARD ACCEPT/:FORWARD DROP}" >"$tmp_restore"
+expect_success assert_v105_docker_only_restore_image "$tmp_restore" 1
+
+v105_ufw_drop=$'*filter\n:INPUT DROP [10:20]\n:FORWARD DROP [30:40]\n:OUTPUT DROP [50:60]\nCOMMIT'
+v105_normalized="$(normalize_v105_builtin_policies <<<"$v105_ufw_drop")"
+[[ "$v105_normalized" == *':INPUT ACCEPT [10:20]'* ]]
+[[ "$v105_normalized" == *':OUTPUT ACCEPT [50:60]'* ]]
+[[ "$v105_normalized" == *':FORWARD DROP [30:40]'* ]]
+
+runtime_inventory_failure_probe() (
+    docker_inventory_snapshot() { return 1; }
+    assert_pristine_secondary_legacy_backends() { return 0; }
+    assert_recovery_runtime_provable
+)
+expect_failure runtime_inventory_failure_probe
+
+stopped_remnanode_probe() (
+    local mock_inventory="$1"
+    local mock_running="$2"
+    docker_inventory_snapshot() { printf '%s\n' "$mock_inventory"; }
+    docker() {
+        [[ "$1" == 'inspect' ]] || return 1
+        if [[ "$2" == 'remnanode' ]]; then
+            return 0
+        fi
+        [[ "$2" == '--format' && "$4" == 'remnanode' ]] || return 1
+        case "$3" in
+            *State.Running*) printf '%s\n' "$mock_running" ;;
+            *Config.Image*) printf '%s\n' "$NODE_IMAGE" ;;
+            *project.working_dir*) printf '%s\n' "$INSTALL_DIR" ;;
+            *) return 1 ;;
+        esac
+    }
+    assert_verified_stopped_remnanode_only
+)
+stopped_inventory=$'abc123\tremnanode\tmanaged-image\texited'
+foreign_inventory="${stopped_inventory}"$'\ndef456\tforeign\tforeign-image\texited'
+expect_success stopped_remnanode_probe "$stopped_inventory" false
+expect_failure stopped_remnanode_probe "$foreign_inventory" false
+expect_failure stopped_remnanode_probe "$stopped_inventory" true
+
+initial_stopped_runtime_probe() (
+    RECOVERY_INITIAL_CONTAINER_PRESENT=1
+    RECOVERY_INITIAL_CONTAINER_RUNNING=0
+    assert_verified_stopped_remnanode_only() { return 0; }
+    assert_pristine_secondary_legacy_backends() { return 0; }
+    assert_initial_recovery_runtime_provable
+)
+expect_success initial_stopped_runtime_probe
+
+native_snapshot_failure_probe() (
+    iptables() { printf 'iptables v1.8.10 (nf_tables)\n'; }
+    ip6tables() { printf 'ip6tables v1.8.10 (nf_tables)\n'; }
+    nft() { return 1; }
+    compute_native_nft_policy_hash
+)
+expect_failure native_snapshot_failure_probe
+
 printf 'A=one\nSECRET_KEY=abc=def==\n' >"$tmp"
 [[ "$(read_setting A "$tmp")" == "one" ]]
 [[ "$(read_setting SECRET_KEY "$tmp")" == "abc=def==" ]]
+
+raw_evidence=$'### iptables-save\n*filter\nCOMMIT\n### nft stateless ruleset\n'
+raw_evidence+="$nft_before_restore"
+printf '%s\n' "$raw_evidence" >"$tmp_restore"
+[[ "$(native_nft_policy_hash_from_raw_evidence "$tmp_restore")" == \
+    "$(nft() { printf '%s\n' "$nft_before_restore"; }; compute_native_nft_policy_hash)" ]]
+
+printf '%s\n' "$iptables_snapshot_a" >"$tmp_restore"
+mock_iptables_save() { printf '%s\n' "$iptables_snapshot_b"; }
+expect_success iptables_restore_image_matches_live "$tmp_restore" mock_iptables_save
+mock_iptables_save() { printf '%s\n' "$iptables_policy_change"; }
+expect_failure iptables_restore_image_matches_live "$tmp_restore" mock_iptables_save
 
 PANEL_IP=''
 NODE_PORT='2222'

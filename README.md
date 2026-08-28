@@ -21,7 +21,7 @@
 Запустите на новом Ubuntu VPS от пользователя с `sudo`:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git && git clone --branch v1.0.8 --depth 1 https://github.com/Andrey-Panin/remnawave-node-bootstrap.git
+sudo apt-get update && sudo apt-get install -y git && git clone --branch v1.0.9 --depth 1 https://github.com/Andrey-Panin/remnawave-node-bootstrap.git
 cd remnawave-node-bootstrap
 sudo bash install.sh
 ```
@@ -115,7 +115,7 @@ IPv4/IPv6 restore images и снимки ruleset до UFW, после UFW и п�
 предыдущее состояние контейнера (отсутствовал/running/stopped). Ошибка самого
 отката возвращает отдельный exit code `70`, оставляет
 `ROLLBACK_INCOMPLETE` и блокирует повторный запуск до сверки. Для незавершённой
-первой установки v1.0.5–v1.0.8 без прежней ноды используется отдельный
+первой установки v1.0.5–v1.0.9 без прежней ноды используется отдельный
 fail-closed recovery:
 
 ```bash

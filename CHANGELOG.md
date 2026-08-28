@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.9 — 2026-08-28
+
+- Recognize Docker's exact empty IPv6 `filter`/`nat` scaffold separately from
+  its IPv4 scaffold while recovering a legacy v1.0.5 transaction.
+- Keep IPv4/IPv6 family mismatches, rule changes, inserted rules, and
+  order changes fail-closed.
+
 ## 1.0.8 — 2026-08-28
 
 - Hash `iptables-nft` policy once through normalized `iptables-save`; retain
